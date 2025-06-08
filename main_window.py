@@ -68,7 +68,7 @@ class MainWindow(QMainWindow):
         # --- UI Setup ---
         self._setup_menus() # Initialize menus and actions
         self._connect_network_signals() # Connect signals from NetworkManager to MainWindow's slots
-
+        
         # Connect the editor's textChanged signal to send updates when user types.
         self.editor.textChanged.connect(self._on_editor_text_changed)
 
@@ -90,7 +90,7 @@ class MainWindow(QMainWindow):
         self.connect_to_host_action.setShortcut(QKeySequence("Ctrl+J")) # "J" for Join
         self.connect_to_host_action.triggered.connect(self._connect_to_host_session)
         session_menu.addAction(self.connect_to_host_action)
-
+        
         # Action to stop the current session (either hosting or client connection)
         self.stop_session_action = QAction("S&top Current Session", self)
         self.stop_session_action.setShortcut(QKeySequence("Ctrl+T")) # "T" for Terminate
@@ -131,14 +131,14 @@ class MainWindow(QMainWindow):
         then delegates the connection request to NetworkManager.
         """
         # Use the static method from ConnectionDialog to get connection details.
-        ip, port = ConnectionDialog.get_details(self)
+        ip, port = ConnectionDialog.get_details(self) 
         if ip and port: # If user provided valid details and clicked OK
             self.status_bar.showMessage(f"Attempting to connect to {ip}:{port}...")
             self.network_manager.connect_to_host(ip, port)
         else:
             # User cancelled or provided invalid details.
             self.status_bar.showMessage("Connection cancelled or invalid details provided.")
-
+            
     @Slot()
     def _stop_current_session(self):
         """
@@ -154,7 +154,7 @@ class MainWindow(QMainWindow):
         self.stop_session_action.setEnabled(False)
         self.status_bar.showMessage("Session stopped. Ready to start or connect.")
         self.editor.setReadOnly(False) # Ensure editor is writable after stopping.
-
+        
         # Reset window title if it was modified for host/client status
         current_title = self.windowTitle()
         if " - Client (View-Only)" in current_title or " - Host" in current_title:
@@ -172,15 +172,15 @@ class MainWindow(QMainWindow):
             text (str): The text content received from the peer.
         """
         self._is_updating_from_network = True # Set flag before changing editor content
-
+        
         # Preserve cursor position and selection to provide a better user experience.
         # When setPlainText is called, the cursor usually goes to the beginning.
         cursor = self.editor.textCursor()
         old_pos = cursor.position()      # Current cursor position
         old_anchor = cursor.anchor()     # Start of selection (or same as position if no selection)
-
+        
         self.editor.setPlainText(text) # Update the editor content
-
+        
         # Try to restore cursor/selection state.
         if old_anchor != old_pos: # If there was a selection
             cursor.setPosition(old_anchor, QTextCursor.MoveAnchor) # Restore anchor
@@ -188,7 +188,7 @@ class MainWindow(QMainWindow):
         else: # Just a cursor position
             cursor.setPosition(old_pos)
         self.editor.setTextCursor(cursor) # Apply the restored cursor
-
+        
         self._is_updating_from_network = False # Reset flag after update
         # self.status_bar.showMessage("Received update.", 2000) # Optional: can be noisy
 
@@ -221,12 +221,12 @@ class MainWindow(QMainWindow):
         self.start_hosting_action.setEnabled(False) # Session active, so can't start another
         self.connect_to_host_action.setEnabled(False) # Or connect to another
         self.stop_session_action.setEnabled(True) # Can stop the current session
-
+        
         base_title = self.windowTitle().split(" - ")[0] # Get base title without status
         if not self.network_manager._is_server: # If this instance is the CLIENT
             # For this simple version, client is view-only.
             # For bi-directional editing, this setReadOnly(True) would be removed/False.
-            self.editor.setReadOnly(True)
+            self.editor.setReadOnly(True) 
             self.setWindowTitle(f"{base_title} - Client (View-Only)")
         else: # If this instance is the HOST and a client just connected
             self.editor.setReadOnly(False) # Host editor remains writable
@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         self.connect_to_host_action.setEnabled(True)
         self.stop_session_action.setEnabled(False)
         self.editor.setReadOnly(False) # Ensure editor is writable again
-
+        
         # Reset window title to its base state
         current_title = self.windowTitle()
         if " - Client (View-Only)" in current_title or " - Host" in current_title:
@@ -265,7 +265,7 @@ class MainWindow(QMainWindow):
         self.connect_to_host_action.setEnabled(True)
         self.stop_session_action.setEnabled(False)
         self.editor.setReadOnly(False)
-
+        
         # Reset window title if it was changed during connection attempt
         current_title = self.windowTitle()
         if " - Client (View-Only)" in current_title or " - Host" in current_title:
@@ -283,11 +283,11 @@ class MainWindow(QMainWindow):
         # Prevents sending updates that were themselves caused by network data.
         if self._is_updating_from_network:
             return
-
+        
         # Check if there's an active network session to send data to.
         is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
-        is_connected_client = (not self.network_manager._is_server and
-                               self.network_manager.client_socket and
+        is_connected_client = (not self.network_manager._is_server and 
+                               self.network_manager.client_socket and 
                                self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
 
         if is_host_with_clients or is_connected_client:
@@ -308,7 +308,7 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     # This block allows testing MainWindow independently, potentially with a mock NetworkManager.
     app = QApplication(sys.argv)
-
+    
     # --- Mock NetworkManager for standalone UI testing ---
     # This class can be used to simulate NetworkManager behavior if network_manager.py
     # is not available or if you want to test UI logic in isolation.
@@ -318,19 +318,19 @@ if __name__ == '__main__':
         peer_disconnected = Signal()
         hosting_started = Signal(str, int)
         connection_failed = Signal(str)
-        _is_server = False
-        server_client_sockets = []
+        _is_server = False 
+        server_client_sockets = [] 
         client_socket = None # Type: QTcpSocket or None
 
-        def start_hosting(self, port):
+        def start_hosting(self, port): 
             print(f"MockNetworkManager: Attempting to start hosting on port {port}")
             # Simulate success:
             # self._is_server = True
-            # self.hosting_started.emit("127.0.0.1", port)
+            # self.hosting_started.emit("127.0.0.1", port) 
             # Simulate failure:
             self.connection_failed.emit("Mock: Failed to start hosting (simulated).")
 
-        def connect_to_host(self, ip, port):
+        def connect_to_host(self, ip, port): 
             print(f"MockNetworkManager: Attempting to connect to host {ip}:{port}")
             # Simulate success:
             # self._is_server = False
@@ -338,14 +338,14 @@ if __name__ == '__main__':
             # Simulate failure:
             self.connection_failed.emit("Mock: Failed to connect (simulated).")
 
-        def send_data(self, text):
+        def send_data(self, text): 
             print(f"MockNetworkManager: Send data requested: {text[:30]}...")
 
-        def stop_session(self):
+        def stop_session(self): 
             print("MockNetworkManager: Stop session requested.")
             # Simulate that stopping a session means peers are disconnected.
             # Actual state changes for _is_server, client_socket etc. would happen here in real NM.
-            self.peer_disconnected.emit()
+            self.peer_disconnected.emit() 
     # --- End of MockNetworkManager ---
 
     # To run main_window.py standalone for UI checks:
@@ -359,7 +359,7 @@ if __name__ == '__main__':
     #       `self.network_manager = MockNetworkManager(self)`
     #    d. Note: `ConnectionDialog` is still imported. If it's also unavailable,
     #       the "Connect to Host..." action would error unless `ConnectionDialog.get_details` is also mocked.
-
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
