@@ -12,8 +12,8 @@ from pyflakes.reporter import Reporter as PyflakesReporter
 from PySide6.QtWidgets import (
     QMainWindow, QPlainTextEdit, QMessageBox, QApplication, QStatusBar, QCompleter
 )
-from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QTextCharFormat, QColor # Added QTextCharFormat, QColor
-from PySide6.QtCore import Slot, Qt, QObject, Signal, QStringListModel, QTimer # Added QTimer
+from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QTextCharFormat, QColor, QKeyEvent # Added QTextCharFormat, QColor, QKeyEvent
+from PySide6.QtCore import Slot, Qt, QObject, Signal, QStringListModel, QTimer, QEvent # Added QTimer, QEvent
 from PySide6.QtNetwork import QTcpSocket # For type hinting in MockNetworkManager
 
 # Import custom modules for networking and connection dialog
@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
         # --- Central Text Editor ---
         self.editor = QPlainTextEdit() # Using QPlainTextEdit for potentially better performance
         self.setCentralWidget(self.editor)
+        self.editor.installEventFilter(self) # Install event filter for auto-pairing
 
         # Syntax Highlighter
         self.highlighter = PythonHighlighter(self.editor.document())
@@ -365,8 +366,102 @@ class MainWindow(QMainWindow):
         # Do not lint if the change came from network sync, or if client is view-only
         if self._is_updating_from_network or (not self.network_manager._is_server and self.editor.isReadOnly()):
             return
-        self.linting_timer.start() 
+        self.linting_timer.start()
 
+    def _insert_paired_character(self, opening_char: str, closing_char: str):
+        """
+        Inserts the opening and closing characters, wrapping selected text
+        if any, or placing the cursor between them if no selection.
+        """
+        cursor = self.editor.textCursor()
+
+        if cursor.hasSelection():
+            selected_text = cursor.selectedText()
+            # Begin and end edit block for undo/redo atomicity (optional but good practice)
+            # cursor.beginEditBlock()
+            cursor.insertText(opening_char + selected_text + closing_char)
+            # cursor.endEditBlock()
+            # The cursor is automatically positioned after the inserted text.
+        else:
+            # cursor.beginEditBlock()
+            cursor.insertText(opening_char + closing_char)
+            cursor.movePosition(QTextCursor.PreviousCharacter) # Move between the pair
+            # cursor.endEditBlock()
+
+        self.editor.setTextCursor(cursor) # Apply cursor changes
+
+    def _handle_key_press_for_auto_pair(self, event: QKeyEvent) -> bool:
+        """
+        Handles key presses for auto-pairing of characters.
+        Inserts paired characters like (), [], {}, "", ''.
+        Includes smart logic for quotes to skip over existing closing quote.
+
+        Args:
+            event (QKeyEvent): The key event.
+
+        Returns:
+            bool: True if the key press was handled, False otherwise.
+        """
+        key_text = event.text()
+        pairs = { # Define pairs locally or as a class attribute if shared
+            '(': ')',
+            '[': ']',
+            '{': '}',
+            '"': '"',
+            "'": "'"
+        }
+
+        cursor = self.editor.textCursor()
+        original_cursor_pos = cursor.position() # For restoring cursor if needed
+
+        # Smart Quotes Logic: If typing a quote and the next char is the same quote, just skip.
+        if key_text in ('"', "'"):
+            # Temporarily move cursor to check character after current position
+            temp_cursor = QTextCursor(cursor) # Create a copy to avoid moving the main cursor yet
+            temp_cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, 1)
+            char_after = temp_cursor.selectedText()
+
+            if char_after == key_text:
+                # Just move the actual cursor forward one position
+                cursor.movePosition(QTextCursor.NextCharacter)
+                self.editor.setTextCursor(cursor)
+                return True # Event handled by skipping
+
+        # General Auto-Pairing for opening characters
+        if key_text in pairs:
+            # Smart Brackets/Parentheses (Optional - deferred for now as per instructions)
+            # Example of how it could be:
+            # if key_text in ('(', '[', '{'):
+            #     temp_cursor = QTextCursor(cursor)
+            #     temp_cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, 1)
+            #     char_after = temp_cursor.selectedText()
+            #     if char_after == pairs[key_text]: # If closing pair is already there
+            #         cursor.movePosition(QTextCursor.NextCharacter)
+            #         self.editor.setTextCursor(cursor)
+            #         return True # Event handled by skipping
+
+            # Proceed with inserting the pair
+            self._insert_paired_character(key_text, pairs[key_text])
+            return True # Event handled by inserting pair
+
+        return False # Event not handled by auto-pair logic
+
+    def eventFilter(self, obj, event: QEvent) -> bool:
+        """
+        Filters events for the editor, specifically to handle key presses
+        for auto-pairing characters.
+        """
+        if obj is self.editor and event.type() == QEvent.KeyPress:
+            # The event should be a QKeyEvent, as QEvent.KeyPress corresponds to it.
+            # No explicit cast needed if methods of QKeyEvent are directly accessed on 'event',
+            # but _handle_key_press_for_auto_pair expects QKeyEvent.
+            # Python's dynamic typing handles this; if it's not a QKeyEvent with 'text()',
+            # _handle_key_press_for_auto_pair would raise an AttributeError.
+            if self._handle_key_press_for_auto_pair(event): # event is QKeyEvent
+                return True # Event was handled, stop further processing
+
+        # Pass the event to the base class implementation for default processing
+        return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
         """

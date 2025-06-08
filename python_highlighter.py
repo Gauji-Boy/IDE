@@ -146,7 +146,7 @@ class PythonHighlighter(QSyntaxHighlighter):
 
         Args:
             text (str): The current block's text.
-            start_expression (QRegularExpression): Regex for the start delimiter (e.g., """).
+            start_expression (QRegularExpression): Regex for the start delimiter (e.g., triple-double-quotes)
             end_expression (QRegularExpression): Regex for the end delimiter (e.g., """).
             target_state (int): The block state to set if this multi-line string continues to the next block.
             fmt (QTextCharFormat): The format to apply to the multi-line string.
