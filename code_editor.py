@@ -3,7 +3,7 @@
 import sys
 from PySide6.QtWidgets import QPlainTextEdit, QApplication, QCompleter, QListView, QToolTip
 from PySide6.QtGui import QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPainter, QFont # Added QFont
-from PySide6.QtCore import Qt, QTimer, QRect, QSize, QStringListModel, QEvent
+from PySide6.QtCore import Qt, QTimer, QRect, QSize, QStringListModel, QEvent, Signal
 from pyflakes.api import check as pyflakes_check
 from pyflakes.reporter import Reporter as PyflakesReporter
 import jedi
@@ -55,10 +55,9 @@ class CodeEditor(QPlainTextEdit):
         self.completer_model = QStringListModel(self)
         self.completer.setModel(self.completer_model)
         # Ensure the signal for string argument is used
-        if hasattr(self.completer, 'activated') and isinstance(getattr(self.completer, 'activated'), Signal):
-             self.completer.activated[str].connect(self._insert_completion_text)
-        elif hasattr(self.completer, 'activated'): # Fallback for older Qt versions or different signal name
-             self.completer.activated.connect(self._insert_completion_text)
+        # The isinstance check for Signal might fail here if Signal was not yet imported,
+        # but it's a type hint / defensive check. The primary connection method is by name.
+        self.completer.activated[str].connect(self._insert_completion_text)
 
 
         # Connect textChanged for completion triggering
