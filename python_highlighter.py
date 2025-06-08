@@ -141,7 +141,7 @@ class PythonHighlighter(QSyntaxHighlighter):
                                  end_expression: QRegularExpression, target_state: int, 
                                  fmt: QTextCharFormat) -> bool:
         """
-        Helper function to process a specific type of multi-line string (e.g., """...""" or '''...''').
+        Helper function to process a specific type of multi-line string (e.g., triple-double-quotes or triple-single-quotes).
         Manages the block state for multi-line comments that span across multiple blocks.
 
         Args:
