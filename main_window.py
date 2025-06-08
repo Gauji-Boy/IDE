@@ -19,7 +19,7 @@ from PySide6.QtNetwork import QTcpSocket # For type hinting in MockNetworkManage
 # Import custom modules for networking and connection dialog
 from network_manager import NetworkManager
 from connection_dialog import ConnectionDialog
-from python_highlighter import PythonHighlighter # Import the highlighter
+from custom_python_highlighter import PythonHighlighter # Import the highlighter
 
 
 class MainWindow(QMainWindow):
