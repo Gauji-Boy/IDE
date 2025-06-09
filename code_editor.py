@@ -33,7 +33,7 @@ class CodeEditor(QPlainTextEdit):
     A QPlainTextEdit subclass with features like auto-pairing,
     real-time linting, and code completion.
     """
-    control_reclaim_requested = Signal()
+    host_wants_to_reclaim_control = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,7 +70,7 @@ class CodeEditor(QPlainTextEdit):
         if self.isReadOnly(): # The host is currently a viewer
             # This event signals the host wants to type again.
             # Instead of processing the key, emit a custom signal.
-            self.control_reclaim_requested.emit()
+            self.host_wants_to_reclaim_control.emit()
             event.accept() # Indicate the event has been handled
             return # Absorb the key press for now
 

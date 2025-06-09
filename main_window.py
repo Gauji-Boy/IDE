@@ -114,7 +114,7 @@ class MainWindow(QMainWindow):
         # Connect signals for this new editor instance
         editor.textChanged.connect(self._on_editor_text_changed_for_network)
         editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
-        editor.control_reclaim_requested.connect(self._handle_editor_control_reclaim_requested)
+        editor.host_wants_to_reclaim_control.connect(self._handle_host_wants_to_reclaim_control)
 
         tab_title = "Untitled"
         if file_path:
@@ -165,7 +165,7 @@ class MainWindow(QMainWindow):
             try: editor_widget.document().modificationChanged.disconnect(self._update_window_title_and_tab_text)
             except RuntimeError: pass
             try:
-                editor_widget.control_reclaim_requested.disconnect(self._handle_editor_control_reclaim_requested)
+                editor_widget.host_wants_to_reclaim_control.disconnect(self._handle_host_wants_to_reclaim_control)
             except RuntimeError:
                 pass # Signal might not have been connected or already disconnected
 
@@ -259,7 +259,7 @@ class MainWindow(QMainWindow):
                     try: doc.modificationChanged.disconnect(self._update_window_title_and_tab_text)
                     except RuntimeError: pass
                 try:
-                    editor.control_reclaim_requested.disconnect(self._handle_editor_control_reclaim_requested)
+                    editor.host_wants_to_reclaim_control.disconnect(self._handle_host_wants_to_reclaim_control)
                 except RuntimeError: # Signal might not have been connected or already disconnected
                     pass
         
@@ -269,9 +269,9 @@ class MainWindow(QMainWindow):
                 current_editor.textChanged.connect(self._on_editor_text_changed_for_network)
                 current_editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
                 try: # Adding a try-except for robustness, though direct connect should be fine
-                    current_editor.control_reclaim_requested.connect(self._handle_editor_control_reclaim_requested)
+                    current_editor.host_wants_to_reclaim_control.connect(self._handle_host_wants_to_reclaim_control)
                 except Exception as e:
-                    print(f"Error connecting control_reclaim_requested: {e}")
+                    print(f"Error connecting host_wants_to_reclaim_control: {e}")
         
         self._update_window_title()
 
@@ -544,6 +544,7 @@ class MainWindow(QMainWindow):
         self.network_manager.control_request_received.connect(self._handle_control_request_received)
         self.network_manager.control_granted_received.connect(self._handle_control_granted_received)
         self.network_manager.control_revoked_received.connect(self._handle_control_revoked_received)
+        self.network_manager.control_declined_received.connect(self._handle_control_declined_received)
 
     @Slot()
     def _format_code(self):
@@ -729,9 +730,8 @@ class MainWindow(QMainWindow):
         # self.has_control now governs this. If client has_control, editor won't be read-only.
 
     @Slot()
-    def _handle_editor_control_reclaim_requested(self):
+    def _handle_host_wants_to_reclaim_control(self): # Renamed
         if self.is_host and not self.has_control and self.session_active:
-            # This means the host was viewing (read-only) and pressed a key
             self.has_control = True
             self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_REVOKE_CONTROL, content='')
             self._update_ui_for_control_state()
@@ -746,16 +746,38 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_control_request_received(self):
-        if self.is_host and self.has_control and self.session_active:
-            self.has_control = False
-            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_GRANT_CONTROL, content='')
-            self._update_ui_for_control_state()
-            self.status_bar.showMessage("Control granted to client.")
-        elif self.is_host and not self.has_control and self.session_active:
-            # If host gets a REQ_CONTROL but client already has control (e.g. duplicate request)
-            # Resend GRANT_CONTROL to ensure client is in the correct state.
-            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_GRANT_CONTROL, content='')
-            self.status_bar.showMessage("Control already with client, re-confirmed.")
+        if self.is_host and self.session_active:
+            # If host receives a request, but client is already believed to have control
+            # (e.g. from a previous grant that client didn't acknowledge yet, or duplicate REQ)
+            # For now, we will still show the dialog. Alternatively, could auto-approve/re-send GRANT.
+            # Let's assume any REQ_CONTROL warrants a fresh approval decision from host.
+
+            reply = QMessageBox.question(self, "Control Request",
+                                         "A client has requested editing control. Do you approve?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No) # Default to No
+
+            if reply == QMessageBox.StandardButton.Yes:
+                # Host approves
+                if not self.has_control and not self.network_manager.server_client_sockets:
+                    # Edge case: Host had granted control, client disconnected, then somehow a REQ comes through.
+                    # Host should reclaim control if no clients.
+                    self.has_control = True
+                    print("Warning: Host approved control grant, but no clients seem connected. Host retains control.")
+                else:
+                    self.has_control = False # Host gives up control
+
+                self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_GRANT_CONTROL, content='')
+                self._update_ui_for_control_state()
+                self.status_bar.showMessage("Control granted to client.")
+            else:
+                # Host declines
+                self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_DECLINE_CONTROL, content='')
+                self.status_bar.showMessage("Control request declined.")
+                # self.has_control remains True (or its previous state if it wasn't True)
+                # _update_ui_for_control_state() might be useful if status bar message needs to be sticky via it
+                self._update_ui_for_control_state() # Ensure UI reflects host still has control
+        # If not host or not session_active, do nothing.
 
     @Slot()
     def _handle_control_granted_received(self):
@@ -791,6 +813,19 @@ class MainWindow(QMainWindow):
                 self.has_control = True
                 self._update_ui_for_control_state()
                 print("Warning: Host received REVOKE_CONTROL. Correcting local state to has_control=True.")
+
+    @Slot()
+    def _handle_control_declined_received(self):
+        if not self.is_host and self.session_active:
+            # Client's request for control was declined by the host.
+            self.status_bar.showMessage("Host declined the control request.", 5000) # Show for 5 seconds
+
+            # Ensure client UI reflects viewer state (button enabled, editor read-only)
+            # self.has_control should already be False if request was pending.
+            # Calling _update_ui_for_control_state() will ensure everything is consistent.
+            if self.has_control: # Should not happen if waiting for response, but as a safeguard
+                self.has_control = False
+            self._update_ui_for_control_state()
 
     def _update_ui_for_control_state(self):
         if not self.session_active:

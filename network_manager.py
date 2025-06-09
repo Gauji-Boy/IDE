@@ -15,6 +15,7 @@ class NetworkManager(QObject):
     MSG_TYPE_REQ_CONTROL = "REQ_CONTROL"
     MSG_TYPE_GRANT_CONTROL = "GRANT_CONTROL"
     MSG_TYPE_REVOKE_CONTROL = "REVOKE_CONTROL"
+    MSG_TYPE_DECLINE_CONTROL = "DECLINE_CONTROL"
 
     """
     Manages network communication (both server and client roles)
@@ -51,6 +52,7 @@ class NetworkManager(QObject):
     control_request_received = Signal() # Emitted by host when client requests control
     control_granted_received = Signal() # Emitted by client when host grants control
     control_revoked_received = Signal() # Emitted by client when host revokes control
+    control_declined_received = Signal() # Emitted by host when client declines control (or host if client declines)
 
 
     def __init__(self, parent=None):
@@ -251,6 +253,8 @@ class NetworkManager(QObject):
                         self.control_granted_received.emit()
                     elif message_type == self.MSG_TYPE_REVOKE_CONTROL:
                         self.control_revoked_received.emit()
+                    elif message_type == self.MSG_TYPE_DECLINE_CONTROL:
+                        self.control_declined_received.emit()
                     else:
                         print(f"NetworkManager: Unknown message type received: {message_type}")
 
