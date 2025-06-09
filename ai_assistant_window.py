@@ -103,4 +103,8 @@ class AIAssistantWindow(QDialog):
         # Clean up resources or save conversation if needed
         super().closeEvent(event)
 
-```
+
+    def closeEvent(self, event):
+        # Clean up resources or save conversation if needed
+        super().closeEvent(event)
+
