@@ -170,19 +170,27 @@ class NetworkManager(QObject):
 
         print(f"NetworkManager: Attempting to connect to {ip_address}:{port}")
         try:
-            host_addr = QHostAddress(ip_address) # Create QHostAddress from string.
-            if host_addr.isNull(): # Basic validation for IP address format.
-                 raise ValueError(f"Invalid IP address format: {ip_address}")
+            host_addr = QHostAddress(ip_address)
+            if host_addr.isNull():
+                 # More specific error for invalid IP format before attempting connection
+                 error_msg = f"Invalid IP address format: {ip_address}. Please use a valid IPv4 (e.g., 127.0.0.1) or IPv6 address."
+                 print(f"NetworkManager: Connection error - {error_msg}")
+                 self.connection_failed.emit(error_msg)
+                 # Ensure client_socket is cleaned up if it was already created
+                 if self.client_socket:
+                     self.client_socket.deleteLater()
+                     self.client_socket = None
+                 return # Stop further processing
             self.client_socket.connectToHost(host_addr, port) # Initiate connection.
-        except ValueError as e: # Catch ValueError from our own validation.
-             error_msg = str(e)
+        except ValueError as e: # Catch ValueError from QHostAddress or our own validation (though explicit check is better)
+             error_msg = str(e) # This might now be less likely if QHostAddress itself doesn't raise ValueError for format
              print(f"NetworkManager: Connection error - {error_msg}")
              self.connection_failed.emit(error_msg)
              if self.client_socket: # Ensure socket is cleaned up if created.
                 self.client_socket.deleteLater()
                 self.client_socket = None
         except RuntimeError as e: # QHostAddress can raise RuntimeError for invalid addresses.
-             error_msg = f"Host address error: {ip_address}. Error: {e}"
+             error_msg = f"Host address error or other runtime issue: {ip_address}. Error: {e}"
              print(f"NetworkManager: Connection error - {error_msg}")
              self.connection_failed.emit(error_msg)
              if self.client_socket:
@@ -242,11 +250,15 @@ class NetworkManager(QObject):
                     raw_message = bytes(data_bytes).decode('utf-8')
                     message = json.loads(raw_message) # Parse JSON
                     message_type = message.get("type")
-                    content = message.get("content")
+                    content = message.get("content") # content can be None if not present
+
+                    print(f"NetworkManager: Received message: type='{message_type}', content_preview='{str(content)[:50]}...'") # Debug print
 
                     if message_type == self.MSG_TYPE_TEXT_UPDATE:
                         if content is not None:
                             self.data_received.emit(content)
+                        else:
+                            print(f"NetworkManager: Warning - {self.MSG_TYPE_TEXT_UPDATE} received with None content.")
                     elif message_type == self.MSG_TYPE_REQ_CONTROL:
                         self.control_request_received.emit()
                     elif message_type == self.MSG_TYPE_GRANT_CONTROL:
@@ -256,14 +268,16 @@ class NetworkManager(QObject):
                     elif message_type == self.MSG_TYPE_DECLINE_CONTROL:
                         self.control_declined_received.emit()
                     else:
-                        print(f"NetworkManager: Unknown message type received: {message_type}")
+                        print(f"NetworkManager: Unknown message type received: '{message_type}'")
 
-                except json.JSONDecodeError:
-                    print(f"NetworkManager: Error decoding JSON from message: {raw_message}")
-                except UnicodeDecodeError:
-                    print("NetworkManager: Error decoding received data (not UTF-8).")
-                except Exception as e:
-                    print(f"NetworkManager: Error in _handle_peer_socket_ready_read: {e}")
+                except json.JSONDecodeError as jde:
+                    print(f"NetworkManager: JSONDecodeError - {jde}. Raw data: {raw_message[:100]}...") # Show part of raw data
+                except UnicodeDecodeError as ude:
+                    print(f"NetworkManager: UnicodeDecodeError - {ude}. Cannot decode received data.")
+                except KeyError as ke: # Should be less likely with .get() but good for robustness
+                    print(f"NetworkManager: KeyError - {ke}. Message structure unexpected: {message}")
+                except Exception as e: # General catch-all
+                    print(f"NetworkManager: Unexpected error in _handle_peer_socket_ready_read: {e}")
         # else:
         #     print(f"NetworkManager: _handle_peer_socket_ready_read triggered by {socket} but no bytes available or invalid socket.")
 
@@ -295,35 +309,36 @@ class NetworkManager(QObject):
             message_type (str): The type of message (e.g., MSG_TYPE_TEXT_UPDATE).
             content (str, optional): The content of the message. Defaults to "".
         """
-        message = {"type": message_type, "content": content}
+        final_data_to_send = None
+        message_dict = {"type": message_type, "content": content} # Keep dict for logging on error
         try:
-            data = json.dumps(message).encode('utf-8')
+            final_data_to_send = json.dumps(message_dict).encode('utf-8')
         except TypeError as e:
-            print(f"NetworkManager: Error serializing message to JSON: {e}")
+            print(f"NetworkManager: Error serializing message to JSON: {e}. Message: {message_dict}")
+            return
+        except Exception as e: # Other potential json errors
+            print(f"NetworkManager: Error during JSON preparation for sending: {e}. Message: {message_dict}")
             return
 
-        if self._is_server: # If this instance is the host/server
+        if not final_data_to_send: # Should not happen if above try/except is thorough
+            return
+
+        print(f"NetworkManager: Sending message: type='{message_type}', content_preview='{str(content)[:50]}...'") # Debug print
+
+        if self._is_server:
             if not self.server_client_sockets:
-                # print("NetworkManager (Host): No clients connected, cannot send data.")
                 return
-            # Iterate over a copy of the list for safe removal if a socket is dead.
-            for client_sock in list(self.server_client_sockets):
-                if client_sock.state() == QTcpSocket.ConnectedState:
-                    bytes_written = client_sock.write(data)
-                    if bytes_written == -1 : # Error during write
-                        print(f"NetworkManager (Host): Error writing to client {client_sock.peerAddress().toString()}")
-                        # Consider removing this client
-                else: # Socket is not connected, remove it.
-                    print(f"NetworkManager (Host): Removing dead socket {client_sock.peerAddress().toString()}")
-                    if client_sock in self.server_client_sockets:
-                         self.server_client_sockets.remove(client_sock)
-                    client_sock.deleteLater()
-        elif self.client_socket and self.client_socket.state() == QTcpSocket.ConnectedState:
-            # If this instance is the client
-            bytes_written = self.client_socket.write(data)
-            if bytes_written == -1:
-                 print(f"NetworkManager (Client): Error writing to host.")
-                 # Connection might be dead, error/disconnect signals should handle cleanup.
+            for client_sock in list(self.server_client_sockets): # Iterate copy
+                if client_sock.isValid() and client_sock.state() == QTcpSocket.ConnectedState:
+                    if client_sock.write(final_data_to_send) == -1:
+                        print(f"NetworkManager (Host): Error writing to client {client_sock.peerAddress().toString()}. State: {client_sock.state()}")
+                        # Consider further error handling like removing problematic client
+                else:
+                    print(f"NetworkManager (Host): Skipping dead/invalid socket {client_sock.peerAddress().toString()}. State: {client_sock.state()}")
+                    # Optionally remove from list here if state implies it's permanently unusable
+        elif self.client_socket and self.client_socket.isValid() and self.client_socket.state() == QTcpSocket.ConnectedState:
+            if self.client_socket.write(final_data_to_send) == -1:
+                print(f"NetworkManager (Client): Error writing to host. State: {self.client_socket.state()}")
         # else:
             # print("NetworkManager: Not connected or not hosting, cannot send data.")
 

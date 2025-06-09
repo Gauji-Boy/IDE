@@ -50,7 +50,7 @@ class CodeEditor(QPlainTextEdit):
         self.textChanged.connect(self.linting_timer.start) # Trigger timer on text change
 
         # Code Completion Setup
-        self.completer = QCompleter(self)
+        self.completer = QCompleter(self) # QCompleter for providing auto-completion suggestions.
         self.completer.setWidget(self)
         self.completer.setCompletionMode(QCompleter.PopupCompletion)
         self.completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -66,6 +66,18 @@ class CodeEditor(QPlainTextEdit):
         self.textChanged.connect(self._on_text_changed_for_completion)
 
     def keyPressEvent(self, event: QKeyEvent):
+        """
+        Overrides the default key press event to implement custom behaviors like:
+        - Emitting a signal if a read-only editor (host as viewer) is typed into.
+        - Smart deletion of paired characters (e.g., "()", "{}").
+        - Wrapping selected text with paired characters.
+        - Auto-indentation (basic, placeholder for future improvement).
+        - Over-typing closing characters if they match.
+        - Auto-inserting paired characters.
+
+        Args:
+            event (QKeyEvent): The key event.
+        """
         # --- Control Reclaim Logic ---
         if self.isReadOnly(): # The host is currently a viewer
             # This event signals the host wants to type again.
@@ -86,14 +98,13 @@ class CodeEditor(QPlainTextEdit):
             # Check if (char_before_cursor, char_after_cursor) form a pair from self.pairs
             is_pair = False
             if char_before_cursor in self.pairs and self.pairs[char_before_cursor] == char_after_cursor:
-                is_pair = True
+                is_pair = True # e.g. cursor is between "()", and backspace is pressed
             
             if is_pair:
-                # Need to ensure no race condition with other backspace handlers if any
-                # For simplicity, we directly manipulate.
+                # Smartly delete the pair
                 cursor.beginEditBlock()
-                cursor.deletePreviousChar() # Deletes char_before_cursor
-                cursor.deleteChar()         # Deletes char_after_cursor
+                cursor.deletePreviousChar() # Deletes the opening character of the pair
+                cursor.deleteChar()         # Deletes the closing character of the pair
                 cursor.endEditBlock()
                 self.setTextCursor(cursor)  # Ensure cursor position is updated if needed
                 event.accept()
@@ -117,35 +128,46 @@ class CodeEditor(QPlainTextEdit):
                 return
         
         # Auto-Insertion of Opening Character (and its pair)
-        if key_text in self.pairs: # key_text is an opening character
-            cursor.insertText(key_text + self.pairs[key_text])
-            cursor.movePosition(QTextCursor.PreviousCharacter) # Move cursor between the pair
+        if key_text in self.pairs: # key_text is an opening character (e.g., '(', '{', '[')
+            cursor.insertText(key_text + self.pairs[key_text]) # Insert opening and its corresponding closing char
+            cursor.movePosition(QTextCursor.PreviousCharacter) # Move cursor back, between the pair
             self.setTextCursor(cursor)
             event.accept()
             return
 
-        super().keyPressEvent(event) # Default handling for other keys
+        super().keyPressEvent(event) # Default handling for other keys (e.g. alphanumeric, Enter, Tab)
 
     def _run_linter(self):
+        """
+        Executes the Pyflakes linter on the current code content.
+        Updates `self.linting_errors` and triggers a highlight update.
+        This method is typically called by a QTimer after a delay.
+        """
         code = self.toPlainText()
-        if not code.strip(): # If code is empty or only whitespace
+        if not code.strip(): # If code is empty or only whitespace, clear errors
             self.linting_errors = []
             self._update_linting_highlights()
             return
 
         reporter = CustomPyflakesReporter()
         try:
-            pyflakes_check(code, 'current_script.py', reporter=reporter)
+            # Run Pyflakes check on the code
+            pyflakes_check(code, 'current_script.py', reporter=reporter) # 'current_script.py' is a dummy filename
             self.linting_errors = reporter.errors
         except Exception as e: # Catch potential errors during linting itself
-            print(f"Linter crashed: {e}")
-            self.linting_errors = [{'lineno': 1, 'message': f"Linter error: {e}", 'col': 0}]
+            print(f"CodeEditor: Linter (pyflakes) crashed or failed: {e}")
+            self.linting_errors = [{'lineno': 1, 'message': f"Linter (pyflakes) error: {e}", 'col': 0}]
         
         self._update_linting_highlights()
 
     def _update_linting_highlights(self):
+        """
+        Applies linting error highlights to the text editor.
+        It creates `ExtraSelection` objects for each error and sets their format
+        (e.g., wavy underline, tooltip).
+        """
         extra_selections = []
-        SelectionClass = self.ExtraSelection # QPlainTextEdit.ExtraSelection
+        SelectionClass = self.ExtraSelection # QPlainTextEdit.ExtraSelection (base class provides this)
 
         for error in self.linting_errors:
             selection = SelectionClass()
@@ -166,21 +188,24 @@ class CodeEditor(QPlainTextEdit):
                     # Highlight the whole line for simplicity, or a specific part using 'col'
                     col_start = error.get('col', 0)
                     line_text = block.text()
-                    # Attempt to highlight a sensible length, e.g., one word or fixed length
-                    # This is a simplification; true error length is harder.
-                    error_length = 1 
+                    # Attempt to highlight a sensible length for the error.
+                    # This is a simplification; accurately determining the error's exact end column
+                    # from Pyflakes (which often gives start col) can be complex.
+                    error_length = 1 # Default to highlighting at least one character.
                     if col_start < len(line_text):
-                        # Try to find a word or a small segment
-                        match = re.search(r'\b\w+\b', line_text[col_start:])
+                        # Try to find a word or a small segment starting at col_start
+                        match = re.search(r'\b\w+\b', line_text[col_start:]) # Find first word from error column
                         if match:
                             error_length = len(match.group(0))
                         else: # Fallback: highlight a few chars or to end of line (simplified)
+                             # Highlight a small fixed number of characters or up to the end of the line.
                             error_length = max(1, min(5, len(line_text) - col_start))
-                    else: # col_start might be at or beyond end of line (e.g. for some EOL errors)
-                        col_start = max(0, len(line_text) -1) # Highlight last char if possible
+                    else: # col_start might be at or beyond end of line (e.g. for some EOL errors or if col info is off)
+                        col_start = max(0, len(line_text) -1) # Highlight last char if possible, or first if line is empty
                         error_length = 1
                     
-                    cursor.setPosition(block.position() + col_start)
+                    cursor.setPosition(block.position() + col_start) # Move cursor to error start
+                    # Keep anchor to select text for highlighting
                     cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, error_length)
                     selection.cursor = cursor
                     extra_selections.append(selection)
@@ -194,6 +219,11 @@ class CodeEditor(QPlainTextEdit):
         self.setExtraSelections(extra_selections)
 
     def _on_text_changed_for_completion(self):
+        """
+        Slot connected to the textChanged signal.
+        Determines if code completion should be triggered based on the text
+        around the cursor (e.g., after a '.', or when starting an identifier).
+        """
         cursor = self.textCursor()
         current_char_pos_in_block = cursor.positionInBlock()
         if current_char_pos_in_block == 0: # No text before cursor on this line
@@ -212,6 +242,10 @@ class CodeEditor(QPlainTextEdit):
             self.completer.popup().hide() # Hide if no longer relevant
 
     def _request_completion(self):
+        """
+        Requests code completions from Jedi based on the current text and cursor position.
+        Populates the QCompleter with suggestions if any are found.
+        """
         text = self.toPlainText()
         cursor = self.textCursor()
         
@@ -234,10 +268,12 @@ class CodeEditor(QPlainTextEdit):
         try:
             # Using a dummy path for Jedi. For more advanced setups,
             # a proper project path or sys.path manipulation might be needed.
+            # Using a dummy path for Jedi. For more advanced setups,
+            # a proper project path or sys.path manipulation might be needed for Jedi to understand imports.
             script = jedi.Script(code=text, path="dummy_path_for_jedi.py")
             completions = script.complete(line=line_num_jedi, column=col_num_jedi)
         except Exception as e:
-            print(f"Jedi completion error: {e}")
+            print(f"CodeEditor: Jedi completion error: {e}") # Informative print
             completions = []
 
         if completions:
@@ -271,7 +307,7 @@ class CodeEditor(QPlainTextEdit):
         # Insert the full completion, effectively replacing the prefix
         cursor.insertText(completion)
         self.setTextCursor(cursor)
-        self.completer.popup().hide() # Ensure popup is hidden
+        self.completer.popup().hide() # Ensure popup is hidden after insertion
 
 # Example usage (optional, for testing this file directly)
 if __name__ == '__main__':

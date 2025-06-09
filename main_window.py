@@ -107,14 +107,30 @@ class MainWindow(QMainWindow):
         self.file_explorer_dock.setWidget(self.file_tree_view)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.file_explorer_dock)
 
+    def _show_message_box(self, title: str, text: str, icon: QMessageBox.Icon = QMessageBox.Warning):
+        # Ensures QMessageBox is imported from PySide6.QtWidgets
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(text)
+        msg_box.setIcon(icon)
+        msg_box.exec() # Use exec() for modal dialog
+
     def _add_new_editor_tab(self, file_path=None, content=""):
+        """
+        Adds a new editor tab to the tab widget.
+        If file_path is provided, it loads the content from that file.
+        Otherwise, an empty untitled tab is created.
+
+        Args:
+            file_path (str, optional): The path to the file to open. Defaults to None.
+            content (str, optional): Initial content for the new tab if no file_path. Defaults to "".
+        """
         editor = CodeEditor()
         highlighter = PythonHighlighter(editor.document())
         
         # Connect signals for this new editor instance
-        editor.textChanged.connect(self._on_editor_text_changed_for_network)
-        editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
-        editor.host_wants_to_reclaim_control.connect(self._handle_host_wants_to_reclaim_control)
+        # highlighter = PythonHighlighter(editor.document()) # Ensure highlighter is set up if signals depend on it
+        self._connect_editor_signals(editor)
 
         tab_title = "Untitled"
         if file_path:
@@ -126,7 +142,7 @@ class MainWindow(QMainWindow):
                 editor.setProperty("file_path", file_path)
                 editor.document().setModified(False) 
             except Exception as e:
-                QMessageBox.warning(self, "Error Opening File", f"Could not open file: {file_path}\n{e}")
+                self._show_message_box("Error Opening File", f"Could not open file: {file_path}\n{e}", QMessageBox.Critical)
                 content = f"# Error opening {file_path}\n{e}"
                 editor.setPlainText(content)
                 tab_title = "Error"
@@ -145,10 +161,20 @@ class MainWindow(QMainWindow):
         self._update_window_title() # Update based on new tab
 
     def _close_editor_tab(self, index):
+        """
+        Handles the request to close an editor tab at the given index.
+        Prompts to save if the tab has unsaved changes.
+        Disconnects signals before removing and deleting the editor widget.
+        Ensures at least one tab remains open.
+
+        Args:
+            index (int): The index of the tab to close.
+        """
         editor_widget = self.editor_tabs.widget(index)
         if editor_widget:
             if editor_widget.document().isModified():
                 self.editor_tabs.setCurrentIndex(index) # Ensure this is the active tab for context
+                # Use the standard QMessageBox.question directly here as it returns a value
                 reply = QMessageBox.question(self, "Unsaved Changes",
                                              f"'{self.editor_tabs.tabText(index).replace('*','')}*' has unsaved changes. Save before closing?",
                                              QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
@@ -160,14 +186,7 @@ class MainWindow(QMainWindow):
                         return 
             
             # Disconnect signals before deleting
-            try: editor_widget.textChanged.disconnect(self._on_editor_text_changed_for_network)
-            except RuntimeError: pass
-            try: editor_widget.document().modificationChanged.disconnect(self._update_window_title_and_tab_text)
-            except RuntimeError: pass
-            try:
-                editor_widget.host_wants_to_reclaim_control.disconnect(self._handle_host_wants_to_reclaim_control)
-            except RuntimeError:
-                pass # Signal might not have been connected or already disconnected
+            self._disconnect_editor_signals(editor_widget)
 
             self.editor_tabs.removeTab(index)
             editor_widget.deleteLater()
@@ -212,7 +231,7 @@ class MainWindow(QMainWindow):
                 self._update_window_title_and_tab_text(False) # Update titles
                 return True
             except Exception as e:
-                QMessageBox.critical(self, "Save Error", f"Could not save file: {file_path}\n{e}")
+                self._show_message_box("Save Error", f"Could not save file: {file_path}\n{e}", QMessageBox.Critical)
                 self.status_bar.showMessage(f"Error saving file: {e}", 5000)
                 return False
         else:
@@ -240,38 +259,33 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"File saved as: {file_path}", 3000)
                 return True
             except Exception as e:
-                QMessageBox.critical(self, "Save As Error", f"Could not save file: {file_path}\n{e}")
+                self._show_message_box("Save As Error", f"Could not save file: {file_path}\n{e}", QMessageBox.Critical)
                 self.status_bar.showMessage(f"Error saving file as: {e}", 5000)
                 return False
         return False # User cancelled dialog
 
 
     def _on_current_tab_changed(self, index):
-        # Disconnect from all tabs first to avoid multiple connections
+        """
+        Handles the change of the current editor tab.
+        Disconnects signals from all editors and then reconnects them only for the
+        newly selected current editor. This ensures signals are not duplicated
+        and are only active for the visible tab.
+        Also updates the window title.
+
+        Args:
+            index (int): The index of the new current tab. -1 if no tab is selected.
+        """
+        # Disconnect from all tabs first
         for i in range(self.editor_tabs.count()):
             editor = self.editor_tabs.widget(i)
-            if editor:
-                try: editor.textChanged.disconnect(self._on_editor_text_changed_for_network)
-                except RuntimeError: pass
-                # Document might be None if tab is being removed
-                doc = editor.document()
-                if doc:
-                    try: doc.modificationChanged.disconnect(self._update_window_title_and_tab_text)
-                    except RuntimeError: pass
-                try:
-                    editor.host_wants_to_reclaim_control.disconnect(self._handle_host_wants_to_reclaim_control)
-                except RuntimeError: # Signal might not have been connected or already disconnected
-                    pass
+            if editor: # Ensure editor is not None
+                self._disconnect_editor_signals(editor) # Use helper
         
-        if index != -1 : # A tab is selected
+        if index != -1: # A tab is selected
             current_editor = self.current_editor
-            if current_editor:
-                current_editor.textChanged.connect(self._on_editor_text_changed_for_network)
-                current_editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
-                try: # Adding a try-except for robustness, though direct connect should be fine
-                    current_editor.host_wants_to_reclaim_control.connect(self._handle_host_wants_to_reclaim_control)
-                except Exception as e:
-                    print(f"Error connecting host_wants_to_reclaim_control: {e}")
+            if current_editor: # Ensure current_editor is not None
+                self._connect_editor_signals(current_editor) # Use helper
         
         self._update_window_title()
 
@@ -291,9 +305,17 @@ class MainWindow(QMainWindow):
             # Also update the tab text itself if it's the current tab
             # This is now handled by _update_window_title_and_tab_text
         elif self.editor_tabs.count() == 0:
-             self.setWindowTitle(base_title)
+             self.setWindowTitle(base_title) # Reset to base title if no tabs are open
     
     def _update_window_title_and_tab_text(self, modified):
+        """
+        Updates the tab text of an editor to indicate its modification status (e.g., adding a '*').
+        If the modified tab is the current tab, it also updates the main window title.
+        This slot is connected to the QTextDocument's modificationChanged signal.
+
+        Args:
+            modified (bool): The new modification state of the document.
+        """
         # Find which editor's document emitted the signal
         editor_doc = self.sender() # This should be the QTextDocument
         if not editor_doc: return
@@ -442,6 +464,16 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Language '{selected_language}' not configured.", 5000)
             return
 
+        # Validate lang_config structure
+        if not isinstance(lang_config.get("cmd"), list) or not lang_config.get("cmd"):
+            self.status_bar.showMessage(f"Configuration error for '{selected_language}': 'cmd' is missing or not a list.", 5000)
+            self._show_message_box("Configuration Error", f"Runner configuration for '{selected_language}' is invalid: 'cmd' must be a non-empty list.")
+            return
+        if not isinstance(lang_config.get("ext"), str):
+            self.status_bar.showMessage(f"Configuration error for '{selected_language}': 'ext' is missing or not a string.", 5000)
+            self._show_message_box("Configuration Error", f"Runner configuration for '{selected_language}' is invalid: 'ext' must be a string.")
+            return
+
         code = editor.toPlainText()
         if not code.strip():
             self.status_bar.showMessage("No code to run.", 3000)
@@ -522,18 +554,54 @@ class MainWindow(QMainWindow):
 
     def _cleanup_temp_files(self):
         if self.current_temp_file_path and os.path.exists(self.current_temp_file_path):
-            try: os.remove(self.current_temp_file_path)
-            except OSError as e: print(f"Error removing temp file {self.current_temp_file_path}: {e}")
+            try:
+                os.remove(self.current_temp_file_path)
+                print(f"Cleaned up temp file: {self.current_temp_file_path}") # Optional: for debugging
+            except OSError as e:
+                print(f"Error removing temp file {self.current_temp_file_path}: {e}")
         self.current_temp_file_path = None
+
         if self.current_output_file_path and os.path.exists(self.current_output_file_path):
-            try: os.remove(self.current_output_file_path)
-            except OSError as e: print(f"Error removing output file {self.current_output_file_path}: {e}")
+            try:
+                os.remove(self.current_output_file_path)
+                print(f"Cleaned up output file: {self.current_output_file_path}") # Optional
+            except OSError as e:
+                print(f"Error removing output file {self.current_output_file_path}: {e}")
+        # For Windows .exe from C++ etc.
         if self.current_output_file_path and sys.platform == "win32" and os.path.exists(self.current_output_file_path + ".exe"):
-            try: os.remove(self.current_output_file_path + ".exe")
-            except OSError as e: print(f"Error removing output file {self.current_output_file_path}.exe: {e}")
+            try:
+                os.remove(self.current_output_file_path + ".exe")
+                print(f"Cleaned up output exe: {self.current_output_file_path}.exe") # Optional
+            except OSError as e:
+                print(f"Error removing output file {self.current_output_file_path}.exe: {e}")
         self.current_output_file_path = None
 
+    def _connect_editor_signals(self, editor: CodeEditor):
+        if editor:
+            editor.textChanged.connect(self._on_editor_text_changed_for_network)
+            editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
+            editor.host_wants_to_reclaim_control.connect(self._handle_host_wants_to_reclaim_control)
+            # Add any other editor signals that need connecting here
+
+    def _disconnect_editor_signals(self, editor: CodeEditor):
+        if editor:
+            try:
+                editor.textChanged.disconnect(self._on_editor_text_changed_for_network)
+            except RuntimeError: pass # Already disconnected or never connected
+
+            doc = editor.document()
+            if doc:
+                try:
+                    doc.modificationChanged.disconnect(self._update_window_title_and_tab_text)
+                except RuntimeError: pass
+
+            try:
+                editor.host_wants_to_reclaim_control.disconnect(self._handle_host_wants_to_reclaim_control)
+            except RuntimeError: pass
+            # Add any other editor signals that need disconnecting here
+
     def _connect_network_signals(self):
+        """Connects signals from the NetworkManager to their respective handlers in MainWindow."""
         self.network_manager.data_received.connect(self._handle_data_received)
         self.network_manager.peer_connected.connect(self._handle_peer_connected)
         self.network_manager.peer_disconnected.connect(self._handle_peer_disconnected)
@@ -573,43 +641,54 @@ class MainWindow(QMainWindow):
         except black.NothingChanged:
             self.status_bar.showMessage("Code is already well-formatted.", 3000)
         except black.InvalidInput as e:
-            QMessageBox.warning(self, "Formatting Error", f"Could not format: {e}")
+            self._show_message_box("Formatting Error", f"Could not format: {e}")
         except Exception as e:
-            QMessageBox.critical(self, "Formatting Error", f"Error: {e}")
+            self._show_message_box("Formatting Error", f"An unexpected error occurred during formatting: {e}", QMessageBox.Critical)
 
     @Slot()
     def _start_hosting_session(self):
+        """Initiates a hosting session using the NetworkManager."""
         self.network_manager.start_hosting(self.DEFAULT_PORT)
         self.status_bar.showMessage(f"Attempting to host on port {self.DEFAULT_PORT}...")
 
     @Slot()
     def _connect_to_host_session(self):
+        """Opens a dialog to get host IP and port, then attempts to connect."""
         ip, port = ConnectionDialog.get_details(self) 
         if ip and port:
             self.network_manager.connect_to_host(ip, port)
             self.status_bar.showMessage(f"Attempting to connect to {ip}:{port}...")
         else:
-            self.status_bar.showMessage("Connection cancelled.")
+            self.status_bar.showMessage("Connection cancelled.") # User cancelled or provided no input
             
     @Slot()
     def _stop_current_session(self):
+        """Stops any active network session (hosting or client connection)."""
+        # This primarily tells the NetworkManager to stop its activities.
+        # NetworkManager will then emit signals like peer_disconnected,
+        # which will trigger further UI updates (_handle_peer_disconnected).
         self.network_manager.stop_session()
 
     @Slot(str)
-    def _handle_data_received(self, text: str):
+    def _handle_data_received(self, text: str): # For text messages
+        """
+        Handles incoming text data (TEXT_UPDATE messages) from the network.
+        Applies the text to the current editor ONLY if this instance does NOT have control.
+        Attempts to restore cursor and scroll positions for a smoother viewing experience.
+
+        Args:
+            text (str): The full text content received from the peer.
+        """
         editor = self.current_editor
         if not editor:
             return
 
         # ==> New check: Only apply text if this instance does NOT have control (i.e., is a viewer) <==
         if self.has_control:
-            # This instance is currently the active editor. It should not be receiving text updates
-            # from others. If it does, it's likely an old message or a logic error.
-            # Ignoring it to protect the active editor's changes.
-            print(f"Warning: Text update received by an active editor. Ignoring. Text: {text[:50]}...")
+            print(f"User (has_control={self.has_control}): Ignoring TEXT_UPDATE received while having control.") # Already has a print
             return
 
-        # Proceed with applying text if this instance is a viewer
+        print(f"User (has_control={self.has_control}): Applying received TEXT_UPDATE.")
         self._is_updating_from_network = True
 
         # Store current cursor and selection to try and restore it
@@ -648,6 +727,15 @@ class MainWindow(QMainWindow):
 
     @Slot(str, int)
     def _handle_hosting_started(self, host_ip: str, port_num: int):
+        """
+        Handles the 'hosting_started' signal from NetworkManager.
+        Updates the application state to reflect that it is now a host.
+
+        Args:
+            host_ip (str): The IP address the server is hosting on.
+            port_num (int): The port number the server is listening on.
+        """
+        print(f"Host starting: Setting is_host=True, has_control=True, session_active=True")
         self.is_host = True
         self.has_control = True
         self.session_active = True # Session is now active
@@ -661,12 +749,20 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_peer_connected(self):
+        """
+        Handles the 'peer_connected' signal from NetworkManager.
+        This is emitted when a client connects to our server, or when this
+        client successfully connects to a host.
+        Updates the application state and UI accordingly.
+        """
         if self.network_manager._is_server: # This instance is the HOST
-            self.is_host = True
-            self.has_control = True
+            print(f"Host detected peer connection: Setting is_host=True, has_control=True, session_active=True")
+            self.is_host = True # Should already be true if server, but confirm
+            self.has_control = True # Host initially has control
         else: # This instance is the CLIENT
+            print(f"Client connected to host: Setting is_host=False, has_control=False, session_active=True")
             self.is_host = False
-            self.has_control = False
+            self.has_control = False # Client starts as viewer
         self.session_active = True # Session is now active
         self._update_ui_for_control_state()
 
@@ -678,6 +774,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_peer_disconnected(self):
+        """
+        Handles the 'peer_disconnected' signal from NetworkManager.
+        Resets session-related state variables and updates the UI to a non-session state.
+        """
+        print(f"Peer disconnected: Setting is_host=False, has_control=False, session_active=False")
         self.is_host = False
         self.has_control = False
         self.session_active = False # Session is no longer active
@@ -692,12 +793,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _handle_connection_failed(self, error_message: str):
+        """
+        Handles the 'connection_failed' signal from NetworkManager.
+        Displays an error message to the user and resets UI elements to a non-session state.
+
+        Args:
+            error_message (str): The error message describing the failure.
+        """
+        print(f"Connection failed: Setting is_host=False, has_control=False, session_active=False")
         self.is_host = False
         self.has_control = False
         self.session_active = False # Session is no longer active
         self._update_ui_for_control_state() # Sets UI to "Ready."
 
-        QMessageBox.critical(self, "Network Error", error_message)
+        self._show_message_box("Network Error", error_message, QMessageBox.Critical)
         self.status_bar.showMessage(f"Connection Error: {error_message}") # Specific error message
 
         self.start_hosting_action.setEnabled(True)
@@ -723,6 +832,7 @@ class MainWindow(QMainWindow):
 
         if is_host_with_clients or is_connected_client:
             # If we have control AND a session is active, then send.
+            print(f"User (has_control={self.has_control}): Sending TEXT_UPDATE")
             current_text = editor.toPlainText()
             # Ensure NetworkManager and its constants are accessible
             self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_TEXT_UPDATE, content=current_text)
@@ -731,21 +841,42 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_host_wants_to_reclaim_control(self): # Renamed
+        """
+        Handles the 'host_wants_to_reclaim_control' signal from the CodeEditor.
+        This occurs when the host, currently in a viewer (read-only) state because
+        a client has control, types in their editor, signaling intent to edit again.
+        The host reclaims control and sends a REVOKE_CONTROL message to the client.
+        """
         if self.is_host and not self.has_control and self.session_active:
+            print(f"Host reclaiming control: Setting has_control=True")
             self.has_control = True
+            print("Host: Reclaiming control, sending REVOKE_CONTROL")
             self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_REVOKE_CONTROL, content='')
             self._update_ui_for_control_state()
             self.status_bar.showMessage("Control reclaimed. You can now edit.")
 
     @Slot()
     def _request_control_button_clicked(self):
+        """
+        Handles the click event of the 'Request Control' button.
+        This is used by a client to request editing control from the host.
+        Sends a REQ_CONTROL message if the instance is a client, doesn't have control,
+        and a session is active.
+        """
         if not self.is_host and not self.has_control and self.session_active:
+            print("Client: Sending REQ_CONTROL")
             self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_REQ_CONTROL, content='')
             self.status_bar.showMessage("Control request sent...")
-            self.request_control_button.setEnabled(False)
+            self.request_control_button.setEnabled(False) # Disable button until response
 
     @Slot()
     def _handle_control_request_received(self):
+        """
+        Handles the 'control_request_received' signal from NetworkManager (Host's perspective).
+        Prompts the host with a dialog to approve or decline the client's request for control.
+        Sends a GRANT_CONTROL or DECLINE_CONTROL message accordingly.
+        """
+        print("Host: Received REQ_CONTROL") # Assuming this is primarily for host
         if self.is_host and self.session_active:
             # If host receives a request, but client is already believed to have control
             # (e.g. from a previous grant that client didn't acknowledge yet, or duplicate REQ)
@@ -759,6 +890,7 @@ class MainWindow(QMainWindow):
 
             if reply == QMessageBox.StandardButton.Yes:
                 # Host approves
+                print(f"Host approving control request: Setting has_control=False")
                 if not self.has_control and not self.network_manager.server_client_sockets:
                     # Edge case: Host had granted control, client disconnected, then somehow a REQ comes through.
                     # Host should reclaim control if no clients.
@@ -767,11 +899,13 @@ class MainWindow(QMainWindow):
                 else:
                     self.has_control = False # Host gives up control
 
+                print("Host: Approving request, sending GRANT_CONTROL")
                 self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_GRANT_CONTROL, content='')
                 self._update_ui_for_control_state()
                 self.status_bar.showMessage("Control granted to client.")
             else:
                 # Host declines
+                print("Host: Declining request, sending DECLINE_CONTROL")
                 self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_DECLINE_CONTROL, content='')
                 self.status_bar.showMessage("Control request declined.")
                 # self.has_control remains True (or its previous state if it wasn't True)
@@ -781,8 +915,15 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_control_granted_received(self):
-        if not self.is_host and self.session_active: # Check session_active
+        """
+        Handles the 'control_granted_received' signal from NetworkManager.
+        Primarily for clients: updates state to `has_control = True` and refreshes UI.
+        Includes a defensive check if a host instance receives this.
+        """
+        print("User: Received GRANT_CONTROL") # Could be client or host (if logic error)
+        if not self.is_host and self.session_active: # Client's perspective
             if not self.has_control: # Only update if not already having control
+                print(f"Client granted control: Setting has_control=True")
                 self.has_control = True
                 self._update_ui_for_control_state()
                 self.status_bar.showMessage("You now have editing control.")
@@ -797,8 +938,15 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_control_revoked_received(self):
-        if not self.is_host and self.session_active: # Check session_active
+        """
+        Handles the 'control_revoked_received' signal from NetworkManager.
+        Primarily for clients: updates state to `has_control = False` (viewer mode)
+        and refreshes UI. Includes defensive checks for host instance.
+        """
+        print("User: Received REVOKE_CONTROL") # Could be client or host
+        if not self.is_host and self.session_active: # Client's perspective
             if self.has_control: # Only update if client thought it had control
+                print(f"Client control revoked: Setting has_control=False")
                 self.has_control = False
                 self._update_ui_for_control_state()
                 self.status_bar.showMessage("Editing control revoked by host.")
@@ -816,7 +964,13 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _handle_control_declined_received(self):
-        if not self.is_host and self.session_active:
+        """
+        Handles the 'control_declined_received' signal from NetworkManager (Client's perspective).
+        This means the host denied the client's request for editing control.
+        Updates the status bar and ensures the client's UI reflects viewer status.
+        """
+        print("Client: Received DECLINE_CONTROL")
+        if not self.is_host and self.session_active: # Client's perspective
             # Client's request for control was declined by the host.
             self.status_bar.showMessage("Host declined the control request.", 5000) # Show for 5 seconds
 
@@ -837,6 +991,8 @@ class MainWindow(QMainWindow):
             self.request_control_button.setEnabled(False)
             return # UI is set for inactive session
 
+        # Log current state before applying changes
+        print(f"Updating UI: is_host={self.is_host}, has_control={self.has_control}, session_active={self.session_active}")
         editor = self.current_editor
         status_message = "Unknown state"
         can_edit = False
