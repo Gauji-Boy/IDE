@@ -18,11 +18,15 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QIcon, QFont, QActionGroup
 from PySide6.QtCore import (
-    Slot, Qt, QObject, Signal, QProcess, QFileInfo, QDir, QStandardPaths
+    Slot, Qt, QObject, Signal, QProcess, QFileInfo, QDir, QStandardPaths, Signal as PySideSignal
 )
 from PySide6.QtNetwork import QTcpSocket
 
-# Import custom modules
+# Import custom modules for AI Assistant
+from ai_assistant_window import AIAssistantWindow
+from ai_tools import ApplyCodeEditSignal
+
+# Import other custom modules
 from network_manager import NetworkManager
 from connection_dialog import ConnectionDialog
 from code_editor import CodeEditor 
@@ -53,6 +57,11 @@ class MainWindow(QMainWindow):
 
         self.network_manager = NetworkManager(self)
         self._is_updating_from_network = False
+
+        # AI Assistant related initializations
+        self.ai_apply_code_signal_emitter = ApplyCodeEditSignal()
+        self.ai_apply_code_signal_emitter.apply_edit_signal.connect(self.handle_apply_code_edit)
+        self.ai_assistant_window_instance = None # To keep track of the window
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -380,6 +389,13 @@ class MainWindow(QMainWindow):
         run_menu.addAction(self.terminal_dest_action)
         run_destination_group.addAction(self.terminal_dest_action)
 
+        # Tools Menu
+        tools_menu = self.menu_bar.addMenu("&Tools")
+        ai_assistant_action = QAction("AI Assistant", self)
+        ai_assistant_action.setShortcut(QKeySequence("Ctrl+Shift+A")) # Optional: add a shortcut
+        ai_assistant_action.triggered.connect(self.show_ai_assistant)
+        tools_menu.addAction(ai_assistant_action)
+
     def _set_run_destination(self, destination: str):
         self.run_destination = destination
         if destination == "Output Panel": self.output_dest_action.setChecked(True)
@@ -618,7 +634,73 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_editor_text_changed_for_network(self):
         editor = self.current_editor
-        if not editor or self._is_updating_from_network:
+        if not editor or self._is_updating_from_network: # Ensure this flag is respected
+            return
+
+        is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
+        is_connected_client = (not self.network_manager._is_server and
+                               self.network_manager.client_socket and
+                               self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
+
+        # Client only sends data if editor is not read-only (which it would be in a session)
+        # Host can always send.
+        if is_host_with_clients or (is_connected_client and not editor.isReadOnly()):
+            current_text = editor.toPlainText()
+            self.network_manager.send_data(current_text)
+
+    # --- AI Assistant Methods ---
+    @Slot()
+    def show_ai_assistant(self):
+        if not self.ai_assistant_window_instance:
+            # Pass 'self' (MainWindow instance) and the signal emitter
+            self.ai_assistant_window_instance = AIAssistantWindow(
+                main_window=self,
+                apply_code_signal_emitter=self.ai_apply_code_signal_emitter,
+                parent=self # Ensure it's properly parented
+            )
+            # Ensure the window is cleaned up when closed
+            self.ai_assistant_window_instance.finished.connect(self._ai_assistant_closed)
+        self.ai_assistant_window_instance.show()
+        self.ai_assistant_window_instance.activateWindow()
+        self.ai_assistant_window_instance.raise_()
+
+    @Slot()
+    def _ai_assistant_closed(self):
+        self.ai_assistant_window_instance = None # Allow garbage collection and recreation
+
+    @Slot(str)
+    def handle_apply_code_edit(self, new_code: str):
+        editor = self.current_editor
+        if editor:
+            # Store cursor position
+            cursor = editor.textCursor()
+            original_pos = cursor.position()
+
+            # Use a flag to prevent feedback loop if network sync is also active for text changes
+            # This specific flag might need to be more general if text changes can come from other sources too
+            # For now, reusing _is_updating_from_network, but consider a more specific one if needed.
+            self._is_updating_from_network = True
+            editor.setPlainText(new_code)
+            self._is_updating_from_network = False # Reset flag
+
+            # Restore cursor position (or try to)
+            new_cursor = editor.textCursor()
+            # Ensure cursor position is within new text bounds
+            new_cursor.setPosition(min(original_pos, len(new_code)))
+            editor.setTextCursor(new_cursor)
+
+            self.status_bar.showMessage("AI Assistant applied code changes.", 3000)
+            # Optionally, mark the document as modified, which also updates tab asterisk
+            editor.document().setModified(True)
+        else:
+            self.status_bar.showMessage("AI Assistant: No active editor to apply changes to.", 3000)
+            # Optionally show a message box to the user
+            QMessageBox.warning(self, "AI Assistant Error", "No active editor selected to apply code changes.")
+    # --- End AI Assistant Methods ---
+
+    def _on_editor_text_changed_for_network(self):
+        editor = self.current_editor
+        if not editor or self._is_updating_from_network: # Check the flag here
             return
         
         is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
