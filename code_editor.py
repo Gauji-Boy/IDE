@@ -1,7 +1,7 @@
 # code_editor.py
 
 import sys
-from PySide6.QtWidgets import QPlainTextEdit, QApplication, QCompleter, QListView, QToolTip 
+from PySide6.QtWidgets import QPlainTextEdit, QApplication, QCompleter, QListView, QToolTip, QTextEdit
 from PySide6.QtGui import QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPainter, QFont # Added QFont
 from PySide6.QtCore import Qt, QTimer, QRect, QSize, QStringListModel, QEvent, Signal
 from pyflakes.api import check as pyflakes_check
@@ -127,7 +127,6 @@ class CodeEditor(QPlainTextEdit):
             pyflakes_check(code, 'current_script.py', reporter=reporter)
             self.linting_errors = reporter.errors
         except Exception as e: # Catch potential errors during linting itself
-            print(f"Linter crashed: {e}")
             self.linting_errors = [{'lineno': 1, 'message': f"Linter error: {e}", 'col': 0}]
         
         self._update_linting_highlights()
