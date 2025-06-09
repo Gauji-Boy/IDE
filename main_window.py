@@ -15,10 +15,11 @@ from PySide6.QtWidgets import (
     QToolBar, QComboBox, QDockWidget, QTabWidget, QPlainTextEdit,
     QSizePolicy, QVBoxLayout, QPushButton, QHBoxLayout, QWidget
 )
-from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QIcon, QFont, QActionGroup
+from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QIcon, QFont, QActionGroup, QKeyEvent
+from PySide6.QtCore import QEvent
 from PySide6.QtCore import (
-    Slot, Qt, QObject, Signal, QProcess, QFileInfo, QDir, QStandardPaths
-) # Added QProcess, QFileInfo, QDir, QStandardPaths
+    Slot, Qt, QObject, Signal, QProcess, QFileInfo, QDir, QStandardPaths, QEvent
+) # Added QProcess, QFileInfo, QDir, QStandardPaths, QEvent
 from PySide6.QtNetwork import QTcpSocket
 
 # Import custom modules
@@ -323,6 +324,327 @@ class MainWindow(QMainWindow):
         self.network_manager.peer_disconnected.connect(self._handle_peer_disconnected)
         self.network_manager.hosting_started.connect(self._handle_hosting_started)
         self.network_manager.connection_failed.connect(self._handle_connection_failed)
+
+
+
+    # --- Session Action Slots ---
+    @Slot()
+    def _start_hosting_session(self):
+        """
+        Slot for the 'Start Hosting Session' menu action.
+        Delegates the hosting request to the NetworkManager.
+        """
+        self.status_bar.showMessage(f"Attempting to start hosting on port {self.DEFAULT_PORT}...")
+        self.network_manager.start_hosting(self.DEFAULT_PORT)
+        # Further UI updates (e.g., enabling/disabling actions, status messages)
+        # are handled by the slots connected to NetworkManager's signals
+        # like _handle_hosting_started or _handle_connection_failed.
+
+    @Slot()
+    def _connect_to_host_session(self):
+        """
+        Slot for the 'Connect to Host' menu action.
+        Uses ConnectionDialog to get host IP and port from the user,
+        then delegates the connection request to NetworkManager.
+        """
+        # Use the static method from ConnectionDialog to get connection details.
+        ip, port = ConnectionDialog.get_details(self) 
+        if ip and port: # If user provided valid details and clicked OK
+            self.status_bar.showMessage(f"Attempting to connect to {ip}:{port}...")
+            self.network_manager.connect_to_host(ip, port)
+        else:
+            # User cancelled or provided invalid details.
+            self.status_bar.showMessage("Connection cancelled or invalid details provided.")
+            
+    @Slot()
+    def _stop_current_session(self):
+        """
+        Slot for the 'Stop Current Session' menu action.
+        Tells NetworkManager to stop any active session (hosting or client).
+        Resets UI elements to their default non-session state.
+        """
+        self.network_manager.stop_session()
+        # Most UI changes related to disconnection are handled by _handle_peer_disconnected.
+        # However, we ensure a consistent state here as well.
+        self.start_hosting_action.setEnabled(True)
+        self.connect_to_host_action.setEnabled(True)
+        self.stop_session_action.setEnabled(False)
+        self.status_bar.showMessage("Session stopped. Ready to start or connect.")
+        self.editor.setReadOnly(False) # Ensure editor is writable after stopping.
+        
+        # Reset window title if it was modified for host/client status
+        current_title = self.windowTitle()
+        if " - Client (View-Only)" in current_title or " - Host" in current_title:
+            self.setWindowTitle(current_title.split(" - ")[0]) # Restore base title
+
+    # --- NetworkManager Signal Handler Slots ---
+    @Slot(str)
+    def _handle_data_received(self, text: str):
+        """
+        Slot for NetworkManager's data_received signal.
+        Updates the editor's content with the received text.
+        Uses the `_is_updating_from_network` flag to prevent echoing this change.
+
+        Args:
+            text (str): The text content received from the peer.
+        """
+        self._is_updating_from_network = True # Set flag before changing editor content
+        
+        # Preserve cursor position and selection to provide a better user experience.
+        # When setPlainText is called, the cursor usually goes to the beginning.
+        cursor = self.editor.textCursor()
+        old_pos = cursor.position()      # Current cursor position
+        old_anchor = cursor.anchor()     # Start of selection (or same as position if no selection)
+        
+        self.editor.setPlainText(text) # Update the editor content
+        
+        # Try to restore cursor/selection state.
+        if old_anchor != old_pos: # If there was a selection
+            cursor.setPosition(old_anchor, QTextCursor.MoveAnchor) # Restore anchor
+            cursor.setPosition(old_pos, QTextCursor.KeepAnchor)    # Restore position, keeping anchor
+        else: # Just a cursor position
+            cursor.setPosition(old_pos)
+        self.editor.setTextCursor(cursor) # Apply the restored cursor
+        
+        self._is_updating_from_network = False # Reset flag after update
+        # self.status_bar.showMessage("Received update.", 2000) # Optional: can be noisy
+
+    @Slot(str, int)
+    def _handle_hosting_started(self, host_ip: str, port_num: int):
+        """
+        Slot for NetworkManager's hosting_started signal.
+        Updates UI to reflect that the application is now hosting a session.
+
+        Args:
+            host_ip (str): The IP address the server is hosting on.
+            port_num (int): The port number the server is listening on.
+        """
+        self.status_bar.showMessage(f"Hosting on {host_ip}:{port_num}. Waiting for connection...")
+        self.start_hosting_action.setEnabled(False) # Disable start hosting (already hosting)
+        self.connect_to_host_action.setEnabled(False) # Disable connect to host (can't be client)
+        self.stop_session_action.setEnabled(True) # Enable stopping the session
+        self.editor.setReadOnly(False) # Host editor is always writable by the host
+        self.setWindowTitle(f"{self.windowTitle().split(' - ')[0]} - Host") # Update window title
+
+    @Slot()
+    def _handle_peer_connected(self):
+        """
+        Slot for NetworkManager's peer_connected signal.
+        Called when this instance (as client) connects to a host,
+        OR when this instance (as host) has a client connect to it.
+        Updates UI to reflect an active collaborative session.
+        """
+        self.status_bar.showMessage("Peer connected. Collaboration active.")
+        self.start_hosting_action.setEnabled(False) # Session active, so can't start another
+        self.connect_to_host_action.setEnabled(False) # Or connect to another
+        self.stop_session_action.setEnabled(True) # Can stop the current session
+        
+        base_title = self.windowTitle().split(" - ")[0] # Get base title without status
+        if not self.network_manager._is_server: # If this instance is the CLIENT
+            # For this simple version, client is view-only.
+            # For bi-directional editing, this setReadOnly(True) would be removed/False.
+            self.editor.setReadOnly(True) 
+            self.setWindowTitle(f"{base_title} - Client (View-Only)")
+        else: # If this instance is the HOST and a client just connected
+            self.editor.setReadOnly(False) # Host editor remains writable
+            self.setWindowTitle(f"{base_title} - Host")
+
+    @Slot()
+    def _handle_peer_disconnected(self):
+        """
+        Slot for NetworkManager's peer_disconnected signal.
+        Resets UI to a non-session state, allowing user to host or connect again.
+        """
+        self.status_bar.showMessage("Peer disconnected. Session ended.")
+        self.start_hosting_action.setEnabled(True)
+        self.connect_to_host_action.setEnabled(True)
+        self.stop_session_action.setEnabled(False)
+        self.editor.setReadOnly(False) # Ensure editor is writable again
+        
+        # Reset window title to its base state
+        current_title = self.windowTitle()
+        if " - Client (View-Only)" in current_title or " - Host" in current_title:
+            self.setWindowTitle(current_title.split(" - ")[0])
+
+    @Slot(str)
+    def _handle_connection_failed(self, error_message: str):
+        """
+        Slot for NetworkManager's connection_failed signal.
+        Displays an error message and resets UI to a non-session state.
+
+        Args:
+            error_message (str): The error message describing the failure.
+        """
+        QMessageBox.critical(self, "Network Error", error_message)
+        self.status_bar.showMessage(f"Error: {error_message}")
+        # Reset UI elements to allow new session attempts
+        self.start_hosting_action.setEnabled(True)
+        self.connect_to_host_action.setEnabled(True)
+        self.stop_session_action.setEnabled(False)
+        self.editor.setReadOnly(False)
+        
+        # Reset window title if it was changed during connection attempt
+        current_title = self.windowTitle()
+        if " - Client (View-Only)" in current_title or " - Host" in current_title:
+            self.setWindowTitle(current_title.split(" - ")[0])
+
+    # --- Editor Change Handler ---
+    @Slot()
+    def _on_editor_text_changed(self):
+        """
+        Slot for the editor's textChanged signal.
+        If the change was made locally by the user (not from a network update)
+        and a network session is active, it sends the current editor content
+        to the NetworkManager for broadcasting/sending.
+        """
+        # Prevents sending updates that were themselves caused by network data.
+        if self._is_updating_from_network:
+            return
+        
+        # --- Network Data Sending ---
+        # Check if there's an active network session to send data to.
+        is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
+        is_connected_client = (not self.network_manager._is_server and 
+                               self.network_manager.client_socket and 
+                               self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
+
+        if is_host_with_clients or is_connected_client:
+            current_text = self.editor.toPlainText()
+            self.network_manager.send_data(current_text)
+            # self.status_bar.showMessage("Sent update.", 1000) # Optional: can be too frequent
+
+        # --- Simplified Completion Trigger on dot (part of _on_editor_text_changed) ---
+        # This is a basic way to trigger completions after a '.' is typed.
+        # It checks if the completer popup is already visible to avoid redundant calls.
+        # Also, ensure not to trigger during network updates or if editor is read-only for client.
+        if not self._is_updating_from_network and not self.editor.isReadOnly():
+            if not self.completer.popup().isVisible():
+                cursor = self.editor.textCursor()
+                if cursor.position() > 0:
+                    # Move cursor back one character, keep anchor to select the char
+                    cursor.movePosition(QTextCursor.PreviousCharacter, QTextCursor.KeepAnchor, 1)
+                    char_before = cursor.selectedText() # Get the selected character
+                    # Move cursor back to original position without selection
+                    # We need to restore the cursor to its original position before checking char_before
+                    original_cursor_pos = cursor.position() -1 # Position before PreviousCharacter
+                    cursor.clearSelection()
+                    cursor.setPosition(original_cursor_pos + 1) # Back to where it was after typing '.'
+                    
+                    if char_before == '.':
+                        self._show_completion()
+    
+    @Slot()
+    def _on_text_changed_for_linting(self):
+        """Restarts the linting timer whenever text is changed by the user."""
+        # Do not lint if the change came from network sync, or if client is view-only
+        if self._is_updating_from_network or (not self.network_manager._is_server and self.editor.isReadOnly()):
+            return
+        self.linting_timer.start()
+
+    def _insert_paired_character(self, opening_char: str, closing_char: str):
+        """
+        Inserts the opening and closing characters, wrapping selected text
+        if any, or placing the cursor between them if no selection.
+        """
+        cursor = self.editor.textCursor()
+
+        if cursor.hasSelection():
+            selected_text = cursor.selectedText()
+            # Begin and end edit block for undo/redo atomicity (optional but good practice)
+            # cursor.beginEditBlock() 
+            cursor.insertText(opening_char + selected_text + closing_char)
+            # cursor.endEditBlock()
+            # The cursor is automatically positioned after the inserted text.
+        else:
+            # cursor.beginEditBlock()
+            cursor.insertText(opening_char + closing_char)
+            cursor.movePosition(QTextCursor.PreviousCharacter) # Move between the pair
+            # cursor.endEditBlock()
+        
+        self.editor.setTextCursor(cursor) # Apply cursor changes
+
+    def _handle_key_press_for_auto_pair(self, event: QKeyEvent) -> bool:
+        """
+        Handles key presses for auto-pairing of characters.
+        Inserts paired characters like (), [], {}, "", ''.
+        Includes smart logic for quotes to skip over existing closing quote.
+
+        Args:
+            event (QKeyEvent): The key event.
+
+        Returns:
+            bool: True if the key press was handled, False otherwise.
+        """
+        key_text = event.text()
+        pairs = { # Define pairs locally or as a class attribute if shared
+            '(': ')',
+            '[': ']',
+            '{': '}',
+            '"': '"',
+            "'": "'"
+        }
+
+        cursor = self.editor.textCursor()
+        original_cursor_pos = cursor.position() # For restoring cursor if needed
+
+        # Smart Quotes Logic: If typing a quote and the next char is the same quote, just skip.
+        if key_text in ('"', "'"):
+            # Temporarily move cursor to check character after current position
+            temp_cursor = QTextCursor(cursor) # Create a copy to avoid moving the main cursor yet
+            temp_cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, 1)
+            char_after = temp_cursor.selectedText()
+            
+            if char_after == key_text:
+                # Just move the actual cursor forward one position
+                cursor.movePosition(QTextCursor.NextCharacter)
+                self.editor.setTextCursor(cursor)
+                return True # Event handled by skipping
+
+        # General Auto-Pairing for opening characters
+        if key_text in pairs:
+            # Smart Brackets/Parentheses (Optional - deferred for now as per instructions)
+            # Example of how it could be:
+            # if key_text in ('(', '[', '{'):
+            #     temp_cursor = QTextCursor(cursor)
+            #     temp_cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, 1)
+            #     char_after = temp_cursor.selectedText()
+            #     if char_after == pairs[key_text]: # If closing pair is already there
+            #         cursor.movePosition(QTextCursor.NextCharacter)
+            #         self.editor.setTextCursor(cursor)
+            #         return True # Event handled by skipping
+
+            # Proceed with inserting the pair
+            self._insert_paired_character(key_text, pairs[key_text])
+            return True # Event handled by inserting pair
+        
+        return False # Event not handled by auto-pair logic
+
+    def eventFilter(self, obj, event: QEvent) -> bool:
+        """
+        Filters events for the editor, specifically to handle key presses
+        for auto-pairing characters.
+        """
+        if obj is self.editor and event.type() == QEvent.KeyPress:
+            # The event should be a QKeyEvent, as QEvent.KeyPress corresponds to it.
+            # No explicit cast needed if methods of QKeyEvent are directly accessed on 'event',
+            # but _handle_key_press_for_auto_pair expects QKeyEvent.
+            # Python's dynamic typing handles this; if it's not a QKeyEvent with 'text()',
+            # _handle_key_press_for_auto_pair would raise an AttributeError.
+            if self._handle_key_press_for_auto_pair(event): # event is QKeyEvent
+                return True # Event was handled, stop further processing
+        
+        # Pass the event to the base class implementation for default processing
+        return super().eventFilter(obj, event)
+
+    def closeEvent(self, event):
+        """
+        Overrides QMainWindow.closeEvent.
+        Ensures any active network session (hosting or client) is cleanly
+        stopped before the application window closes.
+        """
+        self.status_bar.showMessage("Closing session...") # Brief message
+        self.network_manager.stop_session() # Tell NetworkManager to clean up
+        super().closeEvent(event) # Proceed with the normal close event
 
     @Slot()
     def _format_code(self):
