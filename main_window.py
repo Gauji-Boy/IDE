@@ -23,7 +23,7 @@ from PySide6.QtCore import (
 from PySide6.QtNetwork import QTcpSocket
 
 # Import custom modules
-from network_manager import NetworkManager
+from network_manager import NetworkManager # Or specific constants
 from connection_dialog import ConnectionDialog
 from code_editor import CodeEditor 
 from custom_python_highlighter import PythonHighlighter
@@ -63,8 +63,26 @@ class MainWindow(QMainWindow):
         self._setup_output_dock() 
         self._setup_menus()      
         self._connect_network_signals()
+
+        self.is_host = False
+        self.has_control = False # Host starts with control, client without. This will be set properly later.
+        self.session_active = False
+
+        self.request_control_button = QPushButton("Request Control")
+        self.request_control_button.setObjectName("requestControlButton") # For easier identification if needed
+        self.request_control_button.setToolTip("Request editing control from the host")
+        # Add to toolbar (example, might need a specific toolbar or status bar)
+        # If you have a main toolbar, you can add it there:
+        # self.main_toolbar.addWidget(self.request_control_button)
+        # For now, let's add it to the status bar as it's simpler to ensure visibility.
+        self.status_bar.addPermanentWidget(self.request_control_button)
+        self.request_control_button.hide() # Initially hidden, shown for clients.
+
+        # Connect clicked signal
+        self.request_control_button.clicked.connect(self._request_control_button_clicked)
         
         self._add_new_editor_tab() # Start with one empty tab after all UI setup
+        self._update_ui_for_control_state() # Initial UI state update
 
     @property
     def current_editor(self) -> CodeEditor | None:
@@ -96,6 +114,7 @@ class MainWindow(QMainWindow):
         # Connect signals for this new editor instance
         editor.textChanged.connect(self._on_editor_text_changed_for_network)
         editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
+        editor.control_reclaim_requested.connect(self._handle_editor_control_reclaim_requested)
 
         tab_title = "Untitled"
         if file_path:
@@ -145,6 +164,10 @@ class MainWindow(QMainWindow):
             except RuntimeError: pass
             try: editor_widget.document().modificationChanged.disconnect(self._update_window_title_and_tab_text)
             except RuntimeError: pass
+            try:
+                editor_widget.control_reclaim_requested.disconnect(self._handle_editor_control_reclaim_requested)
+            except RuntimeError:
+                pass # Signal might not have been connected or already disconnected
 
             self.editor_tabs.removeTab(index)
             editor_widget.deleteLater()
@@ -235,12 +258,20 @@ class MainWindow(QMainWindow):
                 if doc:
                     try: doc.modificationChanged.disconnect(self._update_window_title_and_tab_text)
                     except RuntimeError: pass
+                try:
+                    editor.control_reclaim_requested.disconnect(self._handle_editor_control_reclaim_requested)
+                except RuntimeError: # Signal might not have been connected or already disconnected
+                    pass
         
         if index != -1 : # A tab is selected
             current_editor = self.current_editor
             if current_editor:
                 current_editor.textChanged.connect(self._on_editor_text_changed_for_network)
                 current_editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
+                try: # Adding a try-except for robustness, though direct connect should be fine
+                    current_editor.control_reclaim_requested.connect(self._handle_editor_control_reclaim_requested)
+                except Exception as e:
+                    print(f"Error connecting control_reclaim_requested: {e}")
         
         self._update_window_title()
 
@@ -509,6 +540,11 @@ class MainWindow(QMainWindow):
         self.network_manager.hosting_started.connect(self._handle_hosting_started)
         self.network_manager.connection_failed.connect(self._handle_connection_failed)
 
+        # New connections for control messages
+        self.network_manager.control_request_received.connect(self._handle_control_request_received)
+        self.network_manager.control_granted_received.connect(self._handle_control_granted_received)
+        self.network_manager.control_revoked_received.connect(self._handle_control_revoked_received)
+
     @Slot()
     def _format_code(self):
         editor = self.current_editor
@@ -561,55 +597,108 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _handle_data_received(self, text: str):
         editor = self.current_editor
-        if not editor: return
+        if not editor:
+            return
+
+        # ==> New check: Only apply text if this instance does NOT have control (i.e., is a viewer) <==
+        if self.has_control:
+            # This instance is currently the active editor. It should not be receiving text updates
+            # from others. If it does, it's likely an old message or a logic error.
+            # Ignoring it to protect the active editor's changes.
+            print(f"Warning: Text update received by an active editor. Ignoring. Text: {text[:50]}...")
+            return
+
+        # Proceed with applying text if this instance is a viewer
         self._is_updating_from_network = True
+
+        # Store current cursor and selection to try and restore it
         cursor = editor.textCursor()
-        old_pos = cursor.position()
-        old_anchor = cursor.anchor()
+        original_pos = cursor.position()
+        original_anchor = cursor.anchor()
+
+        # Store current scrollbar positions
+        # scroll_x = editor.horizontalScrollBar().value() # If you want to restore horizontal
+        scroll_y = editor.verticalScrollBar().value()
+
         editor.setPlainText(text) # Update the content of the current editor
-        if old_anchor != old_pos:
-            cursor.setPosition(old_anchor, QTextCursor.MoveAnchor)
-            cursor.setPosition(old_pos, QTextCursor.KeepAnchor)
+
+        # Attempt to restore cursor/selection
+        # This part can be tricky with full text replacement.
+        # A simple approach is to try to restore position if it's within new text length.
+        new_length = len(editor.toPlainText())
+        restored_pos = min(original_pos, new_length)
+
+        new_cursor = editor.textCursor()
+        if original_anchor != original_pos and min(original_anchor, new_length) != restored_pos :
+            # If there was a selection, try to restore it meaningfully if possible
+            # This is complex; for now, just set position like single cursor
+            new_cursor.setPosition(min(original_anchor, new_length), QTextCursor.MoveMode.MoveAnchor)
+            new_cursor.setPosition(restored_pos, QTextCursor.MoveMode.KeepAnchor)
         else:
-            cursor.setPosition(old_pos)
-        editor.setTextCursor(cursor)
+            new_cursor.setPosition(restored_pos)
+        editor.setTextCursor(new_cursor)
+
+        # Restore scrollbar positions
+        # editor.horizontalScrollBar().setValue(scroll_x) # If restoring horizontal
+        editor.verticalScrollBar().setValue(scroll_y)
+
         self._is_updating_from_network = False
+        # No explicit status bar message here, as text updates should be seamless for viewers.
 
     @Slot(str, int)
     def _handle_hosting_started(self, host_ip: str, port_num: int):
+        self.is_host = True
+        self.has_control = True
+        self.session_active = True # Session is now active
+        self._update_ui_for_control_state()
+
         self.status_bar.showMessage(f"Hosting on {host_ip}:{port_num}. Waiting for connection...")
         self.start_hosting_action.setEnabled(False)
         self.connect_to_host_action.setEnabled(False)
         self.stop_session_action.setEnabled(True)
-        # Host can always edit
-        if self.current_editor: self.current_editor.setReadOnly(False) 
         self._update_window_title() 
 
     @Slot()
     def _handle_peer_connected(self):
+        if self.network_manager._is_server: # This instance is the HOST
+            self.is_host = True
+            self.has_control = True
+        else: # This instance is the CLIENT
+            self.is_host = False
+            self.has_control = False
+        self.session_active = True # Session is now active
+        self._update_ui_for_control_state()
+
         self.status_bar.showMessage("Peer connected. Collaboration active.")
         self.start_hosting_action.setEnabled(False)
         self.connect_to_host_action.setEnabled(False)
         self.stop_session_action.setEnabled(True)
-        # If client, editor becomes read-only
-        if not self.network_manager._is_server and self.current_editor:
-            self.current_editor.setReadOnly(True)
         self._update_window_title() 
 
     @Slot()
     def _handle_peer_disconnected(self):
-        self.status_bar.showMessage("Peer disconnected. Session ended.")
+        self.is_host = False
+        self.has_control = False
+        self.session_active = False # Session is no longer active
+        self._update_ui_for_control_state() # Sets UI to "Ready.", makes editor writable
+
+        self.status_bar.showMessage("Peer disconnected. Session ended.") # Specific message
+
         self.start_hosting_action.setEnabled(True)
         self.connect_to_host_action.setEnabled(True)
         self.stop_session_action.setEnabled(False)
-        # Editor becomes writable again for everyone
-        if self.current_editor: self.current_editor.setReadOnly(False)
         self._update_window_title()
 
     @Slot(str)
     def _handle_connection_failed(self, error_message: str):
+        self.is_host = False
+        self.has_control = False
+        self.session_active = False # Session is no longer active
+        self._update_ui_for_control_state() # Sets UI to "Ready."
+
         QMessageBox.critical(self, "Network Error", error_message)
-        self.status_bar.showMessage(f"Error: {error_message}")
+        self.status_bar.showMessage(f"Connection Error: {error_message}") # Specific error message
+
         self.start_hosting_action.setEnabled(True)
         self.connect_to_host_action.setEnabled(True)
         self.stop_session_action.setEnabled(False)
@@ -620,17 +709,133 @@ class MainWindow(QMainWindow):
         editor = self.current_editor
         if not editor or self._is_updating_from_network:
             return
+
+        # ==> New check: Only send if this instance has control <==
+        if not self.has_control:
+            return
         
+        # Existing session activity checks (these are still useful to ensure a connection exists)
         is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
         is_connected_client = (not self.network_manager._is_server and 
                                self.network_manager.client_socket and 
                                self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
 
-        # Client only sends data if editor is not read-only (which it would be in a session)
-        # Host can always send.
-        if is_host_with_clients or (is_connected_client and not editor.isReadOnly()):
+        if is_host_with_clients or is_connected_client:
+            # If we have control AND a session is active, then send.
             current_text = editor.toPlainText()
-            self.network_manager.send_data(current_text)
+            # Ensure NetworkManager and its constants are accessible
+            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_TEXT_UPDATE, content=current_text)
+        # Removed the 'and not editor.isReadOnly()' from client check as
+        # self.has_control now governs this. If client has_control, editor won't be read-only.
+
+    @Slot()
+    def _handle_editor_control_reclaim_requested(self):
+        if self.is_host and not self.has_control and self.session_active:
+            # This means the host was viewing (read-only) and pressed a key
+            self.has_control = True
+            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_REVOKE_CONTROL, content='')
+            self._update_ui_for_control_state()
+            self.status_bar.showMessage("Control reclaimed. You can now edit.")
+
+    @Slot()
+    def _request_control_button_clicked(self):
+        if not self.is_host and not self.has_control and self.session_active:
+            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_REQ_CONTROL, content='')
+            self.status_bar.showMessage("Control request sent...")
+            self.request_control_button.setEnabled(False)
+
+    @Slot()
+    def _handle_control_request_received(self):
+        if self.is_host and self.has_control and self.session_active:
+            self.has_control = False
+            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_GRANT_CONTROL, content='')
+            self._update_ui_for_control_state()
+            self.status_bar.showMessage("Control granted to client.")
+        elif self.is_host and not self.has_control and self.session_active:
+            # If host gets a REQ_CONTROL but client already has control (e.g. duplicate request)
+            # Resend GRANT_CONTROL to ensure client is in the correct state.
+            self.network_manager.send_data(message_type=NetworkManager.MSG_TYPE_GRANT_CONTROL, content='')
+            self.status_bar.showMessage("Control already with client, re-confirmed.")
+
+    @Slot()
+    def _handle_control_granted_received(self):
+        if not self.is_host and self.session_active: # Check session_active
+            if not self.has_control: # Only update if not already having control
+                self.has_control = True
+                self._update_ui_for_control_state()
+                self.status_bar.showMessage("You now have editing control.")
+            # If client receives GRANT_CONTROL but already believes it has control,
+            # UI should already be correct. _update_ui_for_control_state() will ensure it.
+        elif self.is_host:
+            # This case should ideally not happen (host granting control to itself via network message)
+            # but if it does, ensure host state is correct.
+            if not self.has_control: # If host somehow lost control and got it back this way
+                self.has_control = True
+                self._update_ui_for_control_state()
+
+    @Slot()
+    def _handle_control_revoked_received(self):
+        if not self.is_host and self.session_active: # Check session_active
+            if self.has_control: # Only update if client thought it had control
+                self.has_control = False
+                self._update_ui_for_control_state()
+                self.status_bar.showMessage("Editing control revoked by host.")
+            # If client receives REVOKE_CONTROL but already believes it's a viewer,
+            # UI should be correct. _update_ui_for_control_state() ensures it.
+        elif self.is_host:
+             # Host should not receive this. If it does, it implies a logic error or crossed messages.
+             # Ensure host state remains authoritative if it has control.
+            if not self.has_control: # If host thought it didn't have control
+                # This is an unusual state. Perhaps log it.
+                # For safety, reclaim control visually if this message is received.
+                self.has_control = True
+                self._update_ui_for_control_state()
+                print("Warning: Host received REVOKE_CONTROL. Correcting local state to has_control=True.")
+
+    def _update_ui_for_control_state(self):
+        if not self.session_active:
+            self.status_bar.showMessage("Ready.")
+            if self.current_editor:
+                self.current_editor.setReadOnly(False)
+            self.request_control_button.hide()
+            # Ensure button is disabled too when hidden and session inactive
+            self.request_control_button.setEnabled(False)
+            return # UI is set for inactive session
+
+        editor = self.current_editor
+        status_message = "Unknown state"
+        can_edit = False
+        show_request_button = False # Not directly used, but helps logic
+        request_button_enabled = False
+
+        if self.is_host:
+            self.request_control_button.hide() # Host never shows this button for itself
+            if self.has_control:
+                status_message = "You have editing control."
+                can_edit = True
+            else: # Host is viewer, client has control
+                status_message = "Viewer has control. Press any key to reclaim."
+                can_edit = False # Host's editor is read-only
+        else: # This is a client
+            self.request_control_button.show() # Client always shows button (enabled/disabled based on control)
+            if self.has_control:
+                status_message = "You have editing control."
+                can_edit = True
+                request_button_enabled = False # Client has control, so disable request button
+            else: # Client is viewer
+                status_message = "Viewing only. Click 'Request Control' to edit."
+                can_edit = False
+                request_button_enabled = True # Client is viewer, so enable request button
+
+        self.status_bar.showMessage(status_message)
+        if editor:
+            editor.setReadOnly(not can_edit)
+
+        self.request_control_button.setEnabled(request_button_enabled)
+
+        # Ensure the main window title reflects current state if needed,
+        # e.g., by calling self._update_window_title() if it's not too disruptive.
+        # For now, focus on status bar and editor read-only state.
 
     def closeEvent(self, event):
         if self.process and self.process.state() == QProcess.Running:

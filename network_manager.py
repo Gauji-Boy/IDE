@@ -3,12 +3,19 @@
 # communication logic for the collaborative editor. It handles both hosting
 # (server-side) and connecting (client-side) functionalities using PySide6's
 # QTcpServer and QTcpSocket. It uses signals to communicate network events
-# (like connection, disconnection, data reception) to the main UI (MainWindow).
+# (like connection, disconnection, data reception) to inescapablythe main UI (MainWindow).
 
+import json # Add this import at the top of the file
 from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtNetwork import QTcpServer, QTcpSocket, QHostAddress
 
 class NetworkManager(QObject):
+    # --- Message Type Constants ---
+    MSG_TYPE_TEXT_UPDATE = "TEXT_UPDATE"
+    MSG_TYPE_REQ_CONTROL = "REQ_CONTROL"
+    MSG_TYPE_GRANT_CONTROL = "GRANT_CONTROL"
+    MSG_TYPE_REVOKE_CONTROL = "REVOKE_CONTROL"
+
     """
     Manages network communication (both server and client roles)
     for the collaborative editor.
@@ -38,7 +45,13 @@ class NetworkManager(QObject):
 
     # Emitted when a client fails to connect to a host, or the server fails to start.
     # Provides an error message string.
-    connection_failed = Signal(str)  
+    connection_failed = Signal(str)
+
+    # --- New Signals for Control Exchange ---
+    control_request_received = Signal() # Emitted by host when client requests control
+    control_granted_received = Signal() # Emitted by client when host grants control
+    control_revoked_received = Signal() # Emitted by client when host revokes control
+
 
     def __init__(self, parent=None):
         """
@@ -222,19 +235,33 @@ class NetworkManager(QObject):
         if socket and socket.bytesAvailable() > 0: # Check if there's data to read.
             try:
                 # QTcpSocket is stream-based. readAll() gets what's currently in the buffer.
-                # For simple full-document sync, this is often okay if documents aren't huge.
-                # More robust protocols would use QDataStream with message length prefixing
-                # or a clear end-of-message delimiter.
                 data_bytes = socket.readAll()
-                # data = data_bytes.data().decode('utf-8') # .data() for QByteArray to bytes, then decode
-                data = bytes(data_bytes).decode('utf-8') # Simpler way to convert QByteArray to bytes
-                if data:
-                    self.data_received.emit(data) # Emit signal with the received text.
-                    # print(f"NetworkManager: Data received: {data[:70]}...") # For debugging
-            except UnicodeDecodeError:
-                print("NetworkManager: Error decoding received data (not UTF-8).")
-            except Exception as e:
-                print(f"NetworkManager: Error in _handle_peer_socket_ready_read: {e}")
+                try:
+                    raw_message = bytes(data_bytes).decode('utf-8')
+                    message = json.loads(raw_message) # Parse JSON
+                    message_type = message.get("type")
+                    content = message.get("content")
+
+                    if message_type == self.MSG_TYPE_TEXT_UPDATE:
+                        if content is not None:
+                            self.data_received.emit(content)
+                    elif message_type == self.MSG_TYPE_REQ_CONTROL:
+                        self.control_request_received.emit()
+                    elif message_type == self.MSG_TYPE_GRANT_CONTROL:
+                        self.control_granted_received.emit()
+                    elif message_type == self.MSG_TYPE_REVOKE_CONTROL:
+                        self.control_revoked_received.emit()
+                    else:
+                        print(f"NetworkManager: Unknown message type received: {message_type}")
+
+                except json.JSONDecodeError:
+                    print(f"NetworkManager: Error decoding JSON from message: {raw_message}")
+                except UnicodeDecodeError:
+                    print("NetworkManager: Error decoding received data (not UTF-8).")
+                except Exception as e:
+                    print(f"NetworkManager: Error in _handle_peer_socket_ready_read: {e}")
+        # else:
+        #     print(f"NetworkManager: _handle_peer_socket_ready_read triggered by {socket} but no bytes available or invalid socket.")
 
 
     @Slot()
@@ -252,17 +279,25 @@ class NetworkManager(QObject):
             socket.deleteLater() # Schedule for deletion.
             self.peer_disconnected.emit() # Notify UI that a peer has disconnected.
 
-    @Slot(str)
-    def send_data(self, text: str):
+    @Slot(str, str)
+    def send_data(self, message_type: str, content: str = ""):
         """
-        Sends the given text (UTF-8 encoded) to the connected peer(s).
+        Sends the given message type and content (JSON serialized, UTF-8 encoded)
+        to the connected peer(s).
         If acting as a server, broadcasts to all connected clients.
         If acting as a client, sends to the host.
 
         Args:
-            text (str): The text content to send.
+            message_type (str): The type of message (e.g., MSG_TYPE_TEXT_UPDATE).
+            content (str, optional): The content of the message. Defaults to "".
         """
-        data = text.encode('utf-8') # Ensure text is UTF-8 encoded bytes.
+        message = {"type": message_type, "content": content}
+        try:
+            data = json.dumps(message).encode('utf-8')
+        except TypeError as e:
+            print(f"NetworkManager: Error serializing message to JSON: {e}")
+            return
+
         if self._is_server: # If this instance is the host/server
             if not self.server_client_sockets:
                 # print("NetworkManager (Host): No clients connected, cannot send data.")
