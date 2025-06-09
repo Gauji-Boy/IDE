@@ -1,7 +1,7 @@
 # code_editor.py
 
 import sys
-from PySide6.QtWidgets import QPlainTextEdit, QApplication, QCompleter, QListView, QToolTip
+from PySide6.QtWidgets import QPlainTextEdit, QApplication, QCompleter, QListView, QToolTip 
 from PySide6.QtGui import QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPainter, QFont # Added QFont
 from PySide6.QtCore import Qt, QTimer, QRect, QSize, QStringListModel, QEvent, Signal
 from pyflakes.api import check as pyflakes_check
@@ -40,7 +40,7 @@ class CodeEditor(QPlainTextEdit):
         self.pairs = {'(': ')', '{': '}', '[': ']', '"': '"', "'": "'"}
 
         # Linting Setup
-        self.linting_errors = []
+        self.linting_errors = [] 
         self.linting_timer = QTimer(self)
         self.linting_timer.setSingleShot(True)
         self.linting_timer.setInterval(1500) # 1.5 seconds delay
@@ -76,7 +76,7 @@ class CodeEditor(QPlainTextEdit):
             is_pair = False
             if char_before_cursor in self.pairs and self.pairs[char_before_cursor] == char_after_cursor:
                 is_pair = True
-
+            
             if is_pair:
                 # Need to ensure no race condition with other backspace handlers if any
                 # For simplicity, we directly manipulate.
@@ -104,7 +104,7 @@ class CodeEditor(QPlainTextEdit):
                 self.setTextCursor(cursor)
                 event.accept()
                 return
-
+        
         # Auto-Insertion of Opening Character (and its pair)
         if key_text in self.pairs: # key_text is an opening character
             cursor.insertText(key_text + self.pairs[key_text])
@@ -129,7 +129,7 @@ class CodeEditor(QPlainTextEdit):
         except Exception as e: # Catch potential errors during linting itself
             print(f"Linter crashed: {e}")
             self.linting_errors = [{'lineno': 1, 'message': f"Linter error: {e}", 'col': 0}]
-
+        
         self._update_linting_highlights()
 
     def _update_linting_highlights(self):
@@ -137,19 +137,19 @@ class CodeEditor(QPlainTextEdit):
         if hasattr(self, 'ExtraSelection'): # Check if QPlainTextEdit.ExtraSelection is accessible
             SelectionClass = self.ExtraSelection # For QPlainTextEdit
         else: # Fallback for QTextEdit or other contexts if needed (though QPlainTextEdit is specified)
-            SelectionClass = QTextEdit.ExtraSelection
+            SelectionClass = QTextEdit.ExtraSelection 
 
 
         for error in self.linting_errors:
             selection = SelectionClass()
-
+            
             error_format = QTextCharFormat()
             error_format.setUnderlineStyle(QTextCharFormat.WaveUnderline)
             error_format.setUnderlineColor(QColor("red"))
             error_format.setToolTip(error['message'])
-
+            
             selection.format = error_format
-
+            
             line_no = error['lineno']
             # Ensure line_no is valid and 1-based for findBlockByNumber which is 0-based
             if line_no > 0:
@@ -161,7 +161,7 @@ class CodeEditor(QPlainTextEdit):
                     line_text = block.text()
                     # Attempt to highlight a sensible length, e.g., one word or fixed length
                     # This is a simplification; true error length is harder.
-                    error_length = 1
+                    error_length = 1 
                     if col_start < len(line_text):
                         # Try to find a word or a small segment
                         match = re.search(r'\b\w+\b', line_text[col_start:])
@@ -172,7 +172,7 @@ class CodeEditor(QPlainTextEdit):
                     else: # col_start might be at or beyond end of line (e.g. for some EOL errors)
                         col_start = max(0, len(line_text) -1) # Highlight last char if possible
                         error_length = 1
-
+                    
                     cursor.setPosition(block.position() + col_start)
                     cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, error_length)
                     selection.cursor = cursor
@@ -194,7 +194,7 @@ class CodeEditor(QPlainTextEdit):
             return
 
         current_line_text_up_to_cursor = cursor.block().text()[:current_char_pos_in_block]
-
+        
         # Trigger on '.' or if starting to type an identifier
         # More sophisticated triggers (e.g., after 'import ') could be added.
         if current_line_text_up_to_cursor.endswith('.') or \
@@ -207,7 +207,7 @@ class CodeEditor(QPlainTextEdit):
     def _request_completion(self):
         text = self.toPlainText()
         cursor = self.textCursor()
-
+        
         line_num_jedi = cursor.blockNumber() + 1 # Jedi is 1-indexed for line
         col_num_jedi = cursor.positionInBlock()  # Jedi is 0-indexed for column
 
@@ -236,7 +236,7 @@ class CodeEditor(QPlainTextEdit):
         if completions:
             completion_list = [comp.name for comp in completions]
             self.completer_model.setStringList(completion_list)
-
+            
             if self.completer.completionCount() > 0:
                 cr = self.cursorRect()
                 # Adjust width to be useful for the completer popup
@@ -253,12 +253,12 @@ class CodeEditor(QPlainTextEdit):
 
     def _insert_completion_text(self, completion: str):
         cursor = self.textCursor()
-
+        
         # Calculate how much of the prefix to remove
         # This relies on self.completer.completionPrefix() being set correctly
         # before _request_completion showed the popup.
         prefix = self.completer.completionPrefix()
-
+        
         # Move cursor back by the length of the prefix to delete it
         cursor.movePosition(QTextCursor.PreviousCharacter, QTextCursor.MoveAnchor, len(prefix))
         # Insert the full completion, effectively replacing the prefix
