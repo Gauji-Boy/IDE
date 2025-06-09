@@ -145,11 +145,7 @@ class CodeEditor(QPlainTextEdit):
 
     def _update_linting_highlights(self):
         extra_selections = []
-        if hasattr(self, 'ExtraSelection'): # Check if QPlainTextEdit.ExtraSelection is accessible
-            SelectionClass = self.ExtraSelection # For QPlainTextEdit
-        else: # Fallback for QTextEdit or other contexts if needed (though QPlainTextEdit is specified)
-            SelectionClass = QTextEdit.ExtraSelection 
-
+        SelectionClass = self.ExtraSelection # QPlainTextEdit.ExtraSelection
 
         for error in self.linting_errors:
             selection = SelectionClass()
