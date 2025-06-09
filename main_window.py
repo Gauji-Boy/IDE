@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         self.ai_assistant_window_instance = None # To keep track of the window
 
         # Initialize for new run/debug toolbar widget
-        self.current_run_mode = "Run"
+        self.current_run_mode = "Run" 
         self.action_button = None
         self.dropdown_button = None
         self.run_debug_menu = None
@@ -383,7 +383,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.process and self.process.state() == QProcess.Running:
-            reply = QMessageBox.question(self, "Process Running",
+            reply = QMessageBox.question(self, "Process Running", 
                                          "A process (possibly another debug session or run) is already running. Stop it to start debugging?",
                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
@@ -410,7 +410,7 @@ class MainWindow(QMainWindow):
 
         self._cleanup_temp_files() # Clean up any previous temp files
         temp_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or tempfile.gettempdir()
-
+        
         try:
             # For PDB, the extension must be .py
             with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding='utf-8', dir=temp_dir) as tf:
@@ -435,25 +435,25 @@ class MainWindow(QMainWindow):
         self.terminal_panel_te.appendPlainText(f"Starting PDB: {' '.join(command)}\n---")
 
         self.process = QProcess(self)
-        self.process.setWorkingDirectory(file_dir)
+        self.process.setWorkingDirectory(file_dir) 
 
         self.process.readyReadStandardOutput.connect(self._handle_process_output)
         self.process.readyReadStandardError.connect(self._handle_process_error)
         self.process.finished.connect(self._handle_process_finished)
-        self.process.errorOccurred.connect(self._handle_process_qprocess_error)
+        self.process.errorOccurred.connect(self._handle_process_qprocess_error) 
 
         if sys.platform != "win32":
             self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
 
         self.process.start(command[0], command[1:])
 
-        if not self.process.waitForStarted(3000):
+        if not self.process.waitForStarted(3000): 
             err_msg = self.process.errorString()
             self._append_to_output_or_terminal(f"Error starting PDB process: {err_msg}\n", is_error=True)
-            self._handle_process_finished(-1, QProcess.CrashExit)
+            self._handle_process_finished(-1, QProcess.CrashExit) 
         else:
             self.status_bar.showMessage(f"PDB session started for {QFileInfo(self.current_temp_file_path).fileName()}", 5000)
-            self.terminal_panel_te.setFocus()
+            self.terminal_panel_te.setFocus() 
 
     @Slot()
     def _update_run_action_button_ui(self):
@@ -465,7 +465,7 @@ class MainWindow(QMainWindow):
         else: # Debug mode
             # Using SP_BrowserReload as a placeholder for a 'bug' icon.
             # A proper bug icon might require adding a resource file.
-            self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+            self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)) 
             self.action_button.setToolTip("Debug current script (F5)")
 
     @Slot()
@@ -609,7 +609,7 @@ class MainWindow(QMainWindow):
         if selected_language == "Python":
             # Ensure we use the same Python interpreter running the IDE
             # This makes the Python execution more robust.
-            py_executable = sys.executable if sys.executable else "python"
+            py_executable = sys.executable if sys.executable else "python" 
             lang_config = {"cmd": [py_executable, "{file}"], "ext": ".py"} # Override
 
         if not lang_config:
@@ -843,10 +843,10 @@ class MainWindow(QMainWindow):
         editor = self.current_editor
         if not editor or self._is_updating_from_network: # Ensure this flag is respected
             return
-
+        
         is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
-        is_connected_client = (not self.network_manager._is_server and
-                               self.network_manager.client_socket and
+        is_connected_client = (not self.network_manager._is_server and 
+                               self.network_manager.client_socket and 
                                self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
 
         # Client only sends data if editor is not read-only (which it would be in a session)
@@ -861,7 +861,7 @@ class MainWindow(QMainWindow):
         if not self.ai_assistant_window_instance:
             # Pass 'self' (MainWindow instance) and the signal emitter
             self.ai_assistant_window_instance = AIAssistantWindow(
-                main_window=self,
+                main_window=self, 
                 apply_code_signal_emitter=self.ai_apply_code_signal_emitter,
                 parent=self # Ensure it's properly parented
             )
@@ -882,23 +882,23 @@ class MainWindow(QMainWindow):
             # Store cursor position
             cursor = editor.textCursor()
             original_pos = cursor.position()
-
+            
             # Use a flag to prevent feedback loop if network sync is also active for text changes
             # This specific flag might need to be more general if text changes can come from other sources too
             # For now, reusing _is_updating_from_network, but consider a more specific one if needed.
-            self._is_updating_from_network = True
+            self._is_updating_from_network = True 
             editor.setPlainText(new_code)
             self._is_updating_from_network = False # Reset flag
-
+            
             # Restore cursor position (or try to)
             new_cursor = editor.textCursor()
             # Ensure cursor position is within new text bounds
-            new_cursor.setPosition(min(original_pos, len(new_code)))
+            new_cursor.setPosition(min(original_pos, len(new_code))) 
             editor.setTextCursor(new_cursor)
-
+            
             self.status_bar.showMessage("AI Assistant applied code changes.", 3000)
             # Optionally, mark the document as modified, which also updates tab asterisk
-            editor.document().setModified(True)
+            editor.document().setModified(True) 
         else:
             self.status_bar.showMessage("AI Assistant: No active editor to apply changes to.", 3000)
             # Optionally show a message box to the user
@@ -912,16 +912,16 @@ class MainWindow(QMainWindow):
 
                 if key_event.key() == Qt.Key_Return or key_event.key() == Qt.Key_Enter:
                     cursor = self.terminal_panel_te.textCursor()
-
+                    
                     # Move cursor to the beginning of the current line (block)
                     cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
                     # Select text to the end of the current line (block)
                     cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
                     current_line_text = cursor.selectedText()
 
-                    prompts_to_check = ["(Pdb) ", "Pdb> ", "(Pdb)", "Pdb>", "... ", "...> "]
-                    command_text = current_line_text
-
+                    prompts_to_check = ["(Pdb) ", "Pdb> ", "(Pdb)", "Pdb>", "... ", "...> "] 
+                    command_text = current_line_text 
+                    
                     found_prompt_in_line = False
                     for pdb_prompt in prompts_to_check:
                         prompt_idx = current_line_text.rfind(pdb_prompt)
@@ -929,19 +929,19 @@ class MainWindow(QMainWindow):
                             command_text = current_line_text[prompt_idx + len(pdb_prompt):]
                             found_prompt_in_line = True
                             break
-
+                    
                     if not found_prompt_in_line:
                         command_text = current_line_text
 
                     self.process.write(command_text.encode('utf-8') + b'\n')
-
+                    
                     return False # Let event propagate
 
                 elif key_event.key() == Qt.Key_C and key_event.modifiers() & Qt.ControlModifier:
                     if sys.platform == "win32":
                         self.process.generateConsoleCtrlEvent(0) # CTRL_C_EVENT
                     else:
-                        self.process.terminate()
+                        self.process.terminate() 
                     self.terminal_panel_te.appendPlainText("^C\n")
                     return True # Event handled
 
