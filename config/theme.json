@@ -1,0 +1,17 @@
+{
+    "editor": {
+        "background": "#282c34",
+        "foreground": "#abb2bf",
+        "selection_background": "#3e4451",
+        "line_number_foreground": "#5c6370"
+    },
+    "syntax": {
+        "keyword": "#c678dd",
+        "string": "#98c379",
+        "number": "#d19a66",
+        "comment": "#5c6370",
+        "function": "#61afef",
+        "class": "#e5c07b",
+        "operator": "#56b6c2"
+    }
+}

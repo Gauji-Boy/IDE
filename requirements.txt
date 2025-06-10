@@ -3,3 +3,4 @@ jedi
 pyflakes
 black
 google-generativeai
+pygments

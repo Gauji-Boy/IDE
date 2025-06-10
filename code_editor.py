@@ -1,275 +1,344 @@
-# code_editor.py
-
+from PySide6.QtWidgets import QPlainTextEdit, QCompleter, QApplication, QTextEdit
+from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor, QKeyEvent, QFont, QSyntaxHighlighter
+from PySide6.QtCore import Qt, QTimer, QStringListModel, QRect, QRegularExpression, QFileInfo, Signal, Slot
+import json
+import os
 import sys
-from PySide6.QtWidgets import QPlainTextEdit, QApplication, QCompleter, QListView, QToolTip, QTextEdit
-from PySide6.QtGui import QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPainter, QFont # Added QFont
-from PySide6.QtCore import Qt, QTimer, QRect, QSize, QStringListModel, QEvent, Signal
-from pyflakes.api import check as pyflakes_check
-from pyflakes.reporter import Reporter as PyflakesReporter
-import jedi
-import re # For smart deletion regex (though not explicitly used in current smart deletion logic)
+from PySide6.QtCore import QThreadPool # Import QThreadPool
 
-class CustomPyflakesReporter(PyflakesReporter):
-    def __init__(self):
-        super().__init__(None, None) # error_stream, warning_stream (None, None means don't print to console)
-        self.errors = []
+# Import worker threads
+from worker_threads import JediCompletionWorker, PyflakesLinterWorker, WorkerSignals
 
-    def unexpectedError(self, filename, msg):
-        # Store basic info, actual line might be unknown or less relevant for unexpected
-        self.errors.append({'lineno': 1, 'message': f"Unexpected error: {msg}", 'col': 0})
-
-    def syntaxError(self, filename, msg, lineno, offset, text):
-        self.errors.append({'lineno': lineno, 'message': msg, 'col': offset or 0})
-
-    def flake(self, message): # message is a pyflakes.messages.Message object
-        self.errors.append({
-            'lineno': message.lineno,
-            'message': message.message % message.message_args, # Format the message string
-            'col': message.col
-        })
+from python_highlighter import PythonHighlighter # Import the dedicated highlighter
 
 class CodeEditor(QPlainTextEdit):
-    """
-    A QPlainTextEdit subclass with features like auto-pairing,
-    real-time linting, and code completion.
-    """
+    cursor_position_changed_signal = Signal(int, int) # Line, Column
+    language_changed_signal = Signal(str)
+    control_reclaim_requested = Signal() # New signal for host to reclaim control
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setTabStopDistance(4 * self.fontMetrics().averageCharWidth())
+        self.file_path = None
+        self.current_language = "Plain Text"
 
-        # Auto Pairing Setup
-        self.pairs = {'(': ')', '{': '}', '[': ']', '"': '"', "'": "'"}
+        self.theme_config = self._load_theme_config()
+        self._apply_editor_theme()
 
-        # Linting Setup
-        self.linting_errors = [] 
-        self.linting_timer = QTimer(self)
-        self.linting_timer.setSingleShot(True)
-        self.linting_timer.setInterval(1500) # 1.5 seconds delay
-        self.linting_timer.timeout.connect(self._run_linter)
-        self.textChanged.connect(self.linting_timer.start) # Trigger timer on text change
+        self.highlighter = PythonHighlighter(self.document(), self.theme_config) # Use PythonHighlighter
+        self.thread_pool = QThreadPool.globalInstance() # Get global thread pool
+        self.setup_linter()
+        self.setup_completer()
 
-        # Code Completion Setup
+        self.PAIRS = {
+            '(': ')',
+            '[': ']',
+            '{': '}',
+            '"': '"',
+            "'": "'",
+            '<': '>'
+        }
+        self.CLOSING_CHARS = set(self.PAIRS.values())
+
+        self.textChanged.connect(self._update_language_and_highlighting)
+        self.cursorPositionChanged.connect(self._emit_cursor_position)
+        self._is_programmatic_change = False # Master control flag
+
+    def _load_theme_config(self):
+        print("LOG: CodeEditor._load_theme_config - Entry")
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'theme.json')
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            sys.stderr.write(f"Theme config file not found at {config_path}. Using default theme.\n")
+            return {}
+        except json.JSONDecodeError:
+            sys.stderr.write(f"Error decoding theme config from {config_path}. Using default theme.\n")
+            return {}
+        except Exception as e:
+            sys.stderr.write(f"An unexpected error occurred loading theme config from {config_path}: {e}\n")
+            return {}
+        finally:
+            print("LOG: CodeEditor._load_theme_config - Exit")
+
+    def _apply_editor_theme(self):
+        print("LOG: CodeEditor._apply_editor_theme - Entry")
+        editor_theme = self.theme_config.get("editor", {})
+        bg_color = editor_theme.get("background", "#282c34")
+        fg_color = editor_theme.get("foreground", "#abb2bf")
+        selection_bg = editor_theme.get("selection_background", "#3e4451")
+        line_num_fg = editor_theme.get("line_number_foreground", "#5c6370")
+
+        self.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {bg_color};
+                color: {fg_color};
+                selection-background-color: {selection_bg};
+            }}
+            QPlainTextEdit QAbstractScrollArea::corner {{
+                background-color: {bg_color};
+            }}
+        """)
+        print("LOG: CodeEditor._apply_editor_theme - Exit")
+
+    def _update_language_and_highlighting(self):
+        print("LOG: CodeEditor._update_language_and_highlighting - Entry")
+        if self._is_programmatic_change:
+            print("LOG: CodeEditor._update_language_and_highlighting - Programmatic change, skipping.")
+            return
+
+        old_language = self.current_language
+        
+        if self.file_path:
+            self._is_programmatic_change = True # Set flag before programmatic change
+            self.highlighter.set_lexer_for_filename(self.file_path, self.toPlainText())
+            self._is_programmatic_change = False # Reset flag after programmatic change
+            if self.highlighter.lexer:
+                self.current_language = self.highlighter.lexer.name
+            else:
+                self.current_language = "Plain Text"
+        else:
+            self._is_programmatic_change = True # Set flag before programmatic change
+            self.highlighter.lexer = None
+            self.current_language = "Plain Text"
+            self.highlighter.rehighlight()
+            self._is_programmatic_change = False # Reset flag after programmatic change
+
+        if self.current_language != old_language:
+            self.language_changed_signal.emit(self.current_language)
+        
+        self.linter_timer.start()
+        print("LOG: CodeEditor._update_language_and_highlighting - Exit")
+
+    def _emit_cursor_position(self):
+        print("LOG: CodeEditor._emit_cursor_position - Entry")
+        cursor = self.textCursor()
+        line = cursor.blockNumber() + 1
+        column = cursor.columnNumber() + 1
+        self.cursor_position_changed_signal.emit(line, column)
+        print("LOG: CodeEditor._emit_cursor_position - Exit")
+
+    def setup_completer(self):
+        print("LOG: CodeEditor.setup_completer - Entry")
         self.completer = QCompleter(self)
         self.completer.setWidget(self)
         self.completer.setCompletionMode(QCompleter.PopupCompletion)
         self.completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.completer_model = QStringListModel(self)
-        self.completer.setModel(self.completer_model)
-        # Ensure the signal for string argument is used
-        # The isinstance check for Signal might fail here if Signal was not yet imported,
-        # but it's a type hint / defensive check. The primary connection method is by name.
-        self.completer.activated[str].connect(self._insert_completion_text)
+        self.completer.setModel(QStringListModel())
+        self.completer.activated.connect(self.insert_completion)
 
+        self.cursorPositionChanged.connect(self.show_completion_if_dot)
+        print("LOG: CodeEditor.setup_completer - Exit")
 
-        # Connect textChanged for completion triggering
-        self.textChanged.connect(self._on_text_changed_for_completion)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        key_text = event.text()
+    def show_completion_if_dot(self):
+        print("LOG: CodeEditor.show_completion_if_dot - Entry")
         cursor = self.textCursor()
+        text_before_cursor = self.toPlainText()[:cursor.position()]
+        if text_before_cursor and text_before_cursor[-1] == '.':
+            self.request_completions()
+        elif self.completer.popup().isVisible():
+            self.completer.popup().hide()
+        print("LOG: CodeEditor.show_completion_if_dot - Exit")
 
-        # Smart Deletion
-        if event.key() == Qt.Key_Backspace:
-            char_before_cursor = self.document().characterAt(cursor.position() - 1)
-            char_after_cursor = self.document().characterAt(cursor.position())
+    def request_completions(self):
+        print("LOG: CodeEditor.request_completions - Entry")
+        text = self.toPlainText()
+        line = self.textCursor().blockNumber() + 1
+        column = self.textCursor().columnNumber()
+        file_path = self.file_path if self.file_path else "untitled.py"
 
-            # Check if (char_before_cursor, char_after_cursor) form a pair from self.pairs
-            is_pair = False
-            if char_before_cursor in self.pairs and self.pairs[char_before_cursor] == char_after_cursor:
-                is_pair = True
-            
-            if is_pair:
-                # Need to ensure no race condition with other backspace handlers if any
-                # For simplicity, we directly manipulate.
-                cursor.beginEditBlock()
-                cursor.deletePreviousChar() # Deletes char_before_cursor
-                cursor.deleteChar()         # Deletes char_after_cursor
-                cursor.endEditBlock()
-                self.setTextCursor(cursor)  # Ensure cursor position is updated if needed
-                event.accept()
-                return
+        worker = JediCompletionWorker(text, line, column, file_path)
+        worker.signals.result.connect(self._handle_completions_result)
+        worker.signals.error.connect(lambda msg: sys.stderr.write(f"Jedi error: {msg}\n"))
+        self.thread_pool.start(worker)
+        print("LOG: CodeEditor.request_completions - Exit")
 
-        # Selection Wrapping
-        if key_text in self.pairs and cursor.hasSelection():
-            selected_text = cursor.selectedText()
-            cursor.insertText(key_text + selected_text + self.pairs[key_text])
-            event.accept()
+    @Slot(list)
+    def _handle_completions_result(self, words):
+        print("LOG: CodeEditor._handle_completions_result - Entry")
+        self.completer.model().setStringList(words)
+
+        if words:
+            cursor_rect = self.cursorRect(self.textCursor())
+            self.completer.popup().setGeometry(
+                self.mapToGlobal(cursor_rect.bottomLeft()).x(),
+                self.mapToGlobal(cursor_rect.bottomLeft()).y(),
+                self.completer.popup().sizeHint().width(),
+                self.completer.popup().sizeHint().height()
+            )
+            self.completer.complete()
+        else:
+            self.completer.popup().hide()
+        print("LOG: CodeEditor._handle_completions_result - Exit")
+
+    def insert_completion(self, completion):
+        print("LOG: CodeEditor.insert_completion - Entry")
+        if self.completer.widget() is not self:
+            print("LOG: CodeEditor.insert_completion - Completer widget mismatch, returning.")
             return
 
-        # Over-Typing Closing Character
-        if key_text in self.pairs.values(): # key_text is a closing character
-            # Check if the character we are about to type is the same as the one after the cursor
-            char_after_cursor = self.document().characterAt(cursor.position())
-            if key_text == char_after_cursor:
-                cursor.movePosition(QTextCursor.NextCharacter) # Just move cursor forward
-                self.setTextCursor(cursor)
-                event.accept()
-                return
+        tc = self.textCursor()
+        extra = len(self.completer.completionPrefix())
         
-        # Auto-Insertion of Opening Character (and its pair)
-        if key_text in self.pairs: # key_text is an opening character
-            cursor.insertText(key_text + self.pairs[key_text])
-            cursor.movePosition(QTextCursor.PreviousCharacter) # Move cursor between the pair
-            self.setTextCursor(cursor)
-            event.accept()
-            return
+        self._is_programmatic_change = True # Set flag before programmatic change
+        tc.movePosition(QTextCursor.Left, QTextCursor.KeepAnchor, extra)
+        tc.insertText(completion)
+        self.setTextCursor(tc)
+        self._is_programmatic_change = False # Reset flag after programmatic change
+        print("LOG: CodeEditor.insert_completion - Exit")
 
-        super().keyPressEvent(event) # Default handling for other keys
+    def setup_linter(self):
+        print("LOG: CodeEditor.setup_linter - Entry")
+        self.linter_timer = QTimer(self)
+        self.linter_timer.setInterval(700)
+        self.linter_timer.setSingleShot(True)
+        self.linter_timer.timeout.connect(self.lint_code)
+        print("LOG: CodeEditor.setup_linter - Exit")
 
-    def _run_linter(self):
+    def lint_code(self):
+        print("LOG: CodeEditor.lint_code - Entry")
         code = self.toPlainText()
-        if not code.strip(): # If code is empty or only whitespace
-            self.linting_errors = []
-            self._update_linting_highlights()
-            return
+        file_path = self.file_path if self.file_path else "untitled.py"
+        worker = PyflakesLinterWorker(code)
+        worker.signals.result.connect(self.apply_linting_highlights)
+        worker.signals.error.connect(lambda msg: sys.stderr.write(f"Pyflakes error: {msg}\n"))
+        self.thread_pool.start(worker)
+        print("LOG: CodeEditor.lint_code - Exit")
 
-        reporter = CustomPyflakesReporter()
-        try:
-            pyflakes_check(code, 'current_script.py', reporter=reporter)
-            self.linting_errors = reporter.errors
-        except Exception as e: # Catch potential errors during linting itself
-            self.linting_errors = [{'lineno': 1, 'message': f"Linter error: {e}", 'col': 0}]
-        
-        self._update_linting_highlights()
-
-    def _update_linting_highlights(self):
+    def apply_linting_highlights(self, errors):
+        print("LOG: CodeEditor.apply_linting_highlights - Entry")
+        self._is_programmatic_change = True # Set flag before programmatic change
         extra_selections = []
-        if hasattr(self, 'ExtraSelection'): # Check if QPlainTextEdit.ExtraSelection is accessible
-            SelectionClass = self.ExtraSelection # For QPlainTextEdit
-        else: # Fallback for QTextEdit or other contexts if needed (though QPlainTextEdit is specified)
-            SelectionClass = QTextEdit.ExtraSelection 
+        error_format = QTextCharFormat()
+        error_format.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+        error_format.setUnderlineColor(QColor("red"))
 
+        for line_num, col_num, message in errors:
+            block = self.document().findBlockByNumber(line_num - 1)
+            if block.isValid():
+                cursor = QTextCursor(block)
+                cursor.movePosition(QTextCursor.StartOfBlock)
+                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
 
-        for error in self.linting_errors:
-            selection = SelectionClass()
-            
-            error_format = QTextCharFormat()
-            error_format.setUnderlineStyle(QTextCharFormat.WaveUnderline)
-            error_format.setUnderlineColor(QColor("red"))
-            error_format.setToolTip(error['message'])
-            
-            selection.format = error_format
-            
-            line_no = error['lineno']
-            # Ensure line_no is valid and 1-based for findBlockByNumber which is 0-based
-            if line_no > 0:
-                block = self.document().findBlockByNumber(line_no - 1)
-                if block.isValid():
-                    cursor = QTextCursor(block)
-                    # Highlight the whole line for simplicity, or a specific part using 'col'
-                    col_start = error.get('col', 0)
-                    line_text = block.text()
-                    # Attempt to highlight a sensible length, e.g., one word or fixed length
-                    # This is a simplification; true error length is harder.
-                    error_length = 1 
-                    if col_start < len(line_text):
-                        # Try to find a word or a small segment
-                        match = re.search(r'\b\w+\b', line_text[col_start:])
-                        if match:
-                            error_length = len(match.group(0))
-                        else: # Fallback: highlight a few chars or to end of line (simplified)
-                            error_length = max(1, min(5, len(line_text) - col_start))
-                    else: # col_start might be at or beyond end of line (e.g. for some EOL errors)
-                        col_start = max(0, len(line_text) -1) # Highlight last char if possible
-                        error_length = 1
-                    
-                    cursor.setPosition(block.position() + col_start)
-                    cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, error_length)
-                    selection.cursor = cursor
-                    extra_selections.append(selection)
-                else:
-                     print(f"Linter: Invalid block for line number {line_no}")
-            else: # Error with no specific line (e.g. unexpectedError)
-                # Optionally, could add a general document-level warning or status bar message
-                pass
-
+                selection = QTextEdit.ExtraSelection()
+                selection.format = error_format
+                selection.cursor = cursor
+                extra_selections.append(selection)
 
         self.setExtraSelections(extra_selections)
+        self._is_programmatic_change = False # Reset flag after programmatic change
+        print("LOG: CodeEditor.apply_linting_highlights - Exit")
 
-    def _on_text_changed_for_completion(self):
+    def keyPressEvent(self, event: QKeyEvent):
+        print(f"LOG: CodeEditor.keyPressEvent - Key: {event.key()}, Text: '{event.text()}' - Entry")
+        
+        # Host-side logic to reclaim control
+        if self.isReadOnly(): # The host is currently a viewer
+            # This means the host is trying to type while a client has control.
+            # Instead of typing, emit the signal to reclaim control.
+            self.control_reclaim_requested.emit()
+            event.accept() # Consume the event so no character is typed yet.
+            return
+        
         cursor = self.textCursor()
-        current_char_pos_in_block = cursor.positionInBlock()
-        if current_char_pos_in_block == 0: # No text before cursor on this line
-            self.completer.popup().hide()
+        key = event.key()
+        text = event.text()
+        
+        # Get character to the right of the cursor
+        char_after_cursor = ''
+        if cursor.position() < len(self.toPlainText()):
+            char_after_cursor = self.toPlainText()[cursor.position()]
+
+        # Get character to the left of the cursor
+        char_before_cursor = ''
+        if cursor.position() > 0:
+            char_before_cursor = self.toPlainText()[cursor.position() - 1]
+
+        # 1. Handle Tab for indentation
+        if key == Qt.Key.Key_Tab:
+            self._is_programmatic_change = True
+            if cursor.hasSelection():
+                # Indent selected lines
+                start_block = cursor.blockNumber()
+                end_block = self.document().findBlock(cursor.anchor()).blockNumber()
+                if start_block > end_block:
+                    start_block, end_block = end_block, start_block
+                
+                cursor.beginEditBlock()
+                block = self.document().findBlockByNumber(start_block)
+                while block.isValid() and block.blockNumber() <= end_block:
+                    cursor_for_block = QTextCursor(block)
+                    cursor_for_block.movePosition(QTextCursor.StartOfBlock)
+                    cursor_for_block.insertText("    ") # 4 spaces for tab
+                    block = block.next()
+                cursor.endEditBlock()
+            else:
+                # Insert 4 spaces at cursor position
+                cursor.insertText("    ")
+            self._is_programmatic_change = False
+            event.accept() # Consume the event
+            print("LOG: CodeEditor.keyPressEvent - Tab handled, Exit")
             return
 
-        current_line_text_up_to_cursor = cursor.block().text()[:current_char_pos_in_block]
-        
-        # Trigger on '.' or if starting to type an identifier
-        # More sophisticated triggers (e.g., after 'import ') could be added.
-        if current_line_text_up_to_cursor.endswith('.') or \
-           (len(current_line_text_up_to_cursor) > 0 and current_line_text_up_to_cursor[-1].isalnum() and \
-            (len(current_line_text_up_to_cursor) == 1 or not current_line_text_up_to_cursor[-2].isalnum())):
-            self._request_completion()
-        else:
-            self.completer.popup().hide() # Hide if no longer relevant
+        # 2. Handle "Smart Over-Typing" for Closing Brackets
+        if text in self.CLOSING_CHARS and not cursor.hasSelection():
+            if char_after_cursor == text:
+                self._is_programmatic_change = True
+                cursor.movePosition(QTextCursor.NextCharacter)
+                self.setTextCursor(cursor)
+                self._is_programmatic_change = False
+                event.accept() # Consume the event
+                print("LOG: CodeEditor.keyPressEvent - Over-typing handled, Exit")
+                return
 
-    def _request_completion(self):
-        text = self.toPlainText()
-        cursor = self.textCursor()
-        
-        line_num_jedi = cursor.blockNumber() + 1 # Jedi is 1-indexed for line
-        col_num_jedi = cursor.positionInBlock()  # Jedi is 0-indexed for column
-
-        # Determine completion prefix for QCompleter
-        text_before_cursor = cursor.block().text()[:col_num_jedi]
-        prefix_start_pos = col_num_jedi
-        # Regex to find typical prefix characters (alphanumeric, underscore, dot)
-        # This matches from the end of the string backwards.
-        match = re.search(r"[\w.]*$", text_before_cursor)
-        if match:
-            prefix = match.group(0)
-            self.completer.setCompletionPrefix(prefix)
-        else:
-            self.completer.setCompletionPrefix("")
-
-
-        try:
-            # Using a dummy path for Jedi. For more advanced setups,
-            # a proper project path or sys.path manipulation might be needed.
-            script = jedi.Script(code=text, path="dummy_path_for_jedi.py")
-            completions = script.complete(line=line_num_jedi, column=col_num_jedi)
-        except Exception as e:
-            print(f"Jedi completion error: {e}")
-            completions = []
-
-        if completions:
-            completion_list = [comp.name for comp in completions]
-            self.completer_model.setStringList(completion_list)
-            
-            if self.completer.completionCount() > 0:
-                cr = self.cursorRect()
-                # Adjust width to be useful for the completer popup
-                popup = self.completer.popup()
-                # Basic width calculation, might need refinement for different fonts/styles
-                width = popup.sizeHintForColumn(0) + \
-                        popup.verticalScrollBar().sizeHint().width() + 20 # Padding
-                cr.setWidth(width)
-                self.completer.complete(cr)
+        # 3. Handle Context-Aware Insertion for Opening Brackets (Auto-pairing)
+        if text in self.PAIRS:
+            if cursor.hasSelection():
+                # Wrap selection
+                selected_text = cursor.selectedText()
+                self._is_programmatic_change = True
+                cursor.insertText(text + selected_text + self.PAIRS[text])
+                cursor.setPosition(cursor.position() - len(selected_text) - 1) # Move cursor back inside
+                self.setTextCursor(cursor)
+                self._is_programmatic_change = False
+                event.accept() # Consume the event
+                print("LOG: CodeEditor.keyPressEvent - Auto-pair wrap handled, Exit")
+                return
             else:
-                self.completer.popup().hide()
-        else:
-            self.completer.popup().hide()
+                # Context-aware insertion
+                should_auto_pair = False
+                if not char_after_cursor or char_after_cursor.isspace() or char_after_cursor in self.CLOSING_CHARS:
+                    should_auto_pair = True
+                
+                # Special case for quotes: don't auto-pair if char before is same quote
+                if text in ['"', "'"] and char_before_cursor == text:
+                    should_auto_pair = False
 
-    def _insert_completion_text(self, completion: str):
-        cursor = self.textCursor()
+                if should_auto_pair:
+                    self._is_programmatic_change = True
+                    cursor.insertText(text + self.PAIRS[text])
+                    cursor.movePosition(QTextCursor.PreviousCharacter) # Move cursor back inside
+                    self.setTextCursor(cursor)
+                    self._is_programmatic_change = False
+                    event.accept() # Consume the event
+                    print("LOG: CodeEditor.keyPressEvent - Context-aware auto-pair insert handled, Exit")
+                    return
         
-        # Calculate how much of the prefix to remove
-        # This relies on self.completer.completionPrefix() being set correctly
-        # before _request_completion showed the popup.
-        prefix = self.completer.completionPrefix()
-        
-        # Move cursor back by the length of the prefix to delete it
-        cursor.movePosition(QTextCursor.PreviousCharacter, QTextCursor.MoveAnchor, len(prefix))
-        # Insert the full completion, effectively replacing the prefix
-        cursor.insertText(completion)
-        self.setTextCursor(cursor)
-        self.completer.popup().hide() # Ensure popup is hidden
+        # 4. Smart Backspace
+        if key == Qt.Key.Key_Backspace and not cursor.hasSelection():
+            if char_before_cursor in self.PAIRS and char_after_cursor == self.PAIRS[char_before_cursor]:
+                self._is_programmatic_change = True
+                cursor.beginEditBlock()
+                cursor.deletePreviousChar() # Delete opening char
+                cursor.deleteChar()         # Delete closing char
+                cursor.endEditBlock()
+                self.setTextCursor(cursor)
+                self._is_programmatic_change = False
+                event.accept() # Consume the event
+                print("LOG: CodeEditor.keyPressEvent - Smart Backspace handled, Exit")
+                return
 
-# Example usage (optional, for testing this file directly)
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    editor = CodeEditor()
-    editor.setWindowTitle("Code Editor Test")
-    editor.setPlainText("import os\n\ndef my_func(param1, param2):\n    # This is a comment\n    s = \"a string\"\n    s2 = 'another string'\n    num = 123 + 0xFA - 0b101\n    if param1 == os.path:\n        print(s)\n    return s\n\nclass MyClass:\n    def method(self):\n        # Test completion\n        # os.\n        # self.\n        pass\n\nmy_obj = MyClass()\nmy_obj.meth\n\n# Linting test\n# unused_var = 10 \n# print(undeclared_variable)\n")
-    editor.show()
-    sys.exit(app.exec())
+        # If none of the special cases are handled, call the default handler
+        super().keyPressEvent(event)
+        print("LOG: CodeEditor.keyPressEvent - Default handler, Exit")

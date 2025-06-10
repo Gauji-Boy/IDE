@@ -1,1052 +1,1291 @@
-# main_window.py
-# This file defines the MainWindow class, which is the main user interface
-# for the Simple Collaborative Editor. It integrates the text editor,
-# menu actions, status bar, execution controls, output panels,
-# and the NetworkManager for handling collaborative sessions.
-
-import sys
-import black # For code formatting
+from PySide6.QtWidgets import QMainWindow, QTabWidget, QStatusBar, QDockWidget, QApplication, QWidget, QVBoxLayout, QMenuBar, QMenu, QFileDialog, QLabel, QToolBar, QInputDialog, QMessageBox, QLineEdit, QPushButton, QToolButton, QComboBox, QPlainTextEdit
+from PySide6.QtGui import QAction, QIcon, QTextCharFormat, QColor, QTextCursor, QActionGroup, QFont
+from PySide6.QtCore import Qt, QProcess, Signal, Slot, QPoint, QModelIndex, QThreadPool, QStandardPaths, QObject
+from file_explorer import FileExplorer
+from code_editor import CodeEditor
+from interactive_terminal import InteractiveTerminal # Import the new interactive terminal
+from network_manager import NetworkManager # Import NetworkManager
+from connection_dialog import ConnectionDialog # Import ConnectionDialog
+from ai_assistant_window import AIAssistantWindow # Import the AI Assistant Window
+from ai_tools import AITools # Import AITools
 import tempfile
 import os
-import shlex 
-
-from PySide6.QtWidgets import (
-    QMainWindow, QMessageBox, QApplication, QStatusBar,
-    QToolBar, QComboBox, QDockWidget, QTabWidget, QPlainTextEdit, 
-    QSizePolicy, QVBoxLayout, QPushButton, QHBoxLayout, QWidget,
-    QTreeView, QFileSystemModel, QFileDialog, QToolButton, QMenu, QStyle,
-    QInputDialog, QLineEdit
-)
-from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QIcon, QFont, QActionGroup
-from PySide6.QtCore import (
-    Slot, Qt, QObject, Signal, QProcess, QFileInfo, QDir, QStandardPaths, Signal as PySideSignal, QEvent
-)
-from PySide6.QtNetwork import QTcpSocket
-
-# Import custom modules for AI Assistant
-from ai_assistant_window import AIAssistantWindow
-from ai_tools import ApplyCodeEditSignal
-
-# Import other custom modules
-from network_manager import NetworkManager
-from connection_dialog import ConnectionDialog
-from code_editor import CodeEditor 
-from custom_python_highlighter import PythonHighlighter
-from config import RUNNER_CONFIG
+import sys
+import shutil # For rmtree
+import json # Import json for structured messages
+import black # Import black for synchronous formatting
 
 class MainWindow(QMainWindow):
-    DEFAULT_PORT = 54321
-    untitled_tab_counter = 0 
+    # Signals for AI Tools to get results back from MainWindow
+    ai_get_current_code_result = Signal(str)
+    ai_read_file_result = Signal(str, str) # file_path, content/error_message
+    ai_write_file_result = Signal(str, bool, str) # file_path, success, message
+    ai_list_directory_result = Signal(str, str) # path, json_string_of_contents/error_message
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        self.setWindowTitle("Code-Sync IDE") 
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Aether Editor")
         self.setGeometry(100, 100, 1200, 800)
 
-        self.editor_tabs = QTabWidget()
-        self.editor_tabs.setTabsClosable(True)
-        self.editor_tabs.tabCloseRequested.connect(self._close_editor_tab)
-        self.editor_tabs.currentChanged.connect(self._on_current_tab_changed)
-        self.setCentralWidget(self.editor_tabs)
+        self.threadpool = QThreadPool() # Initialize QThreadPool for background tasks
+        print(f"Multithreading with maximum {self.threadpool.maxThreadCount()} threads")
+
+        self.threadpool = QThreadPool() # Initialize QThreadPool for background tasks
+        print(f"Multithreading with maximum {self.threadpool.maxThreadCount()} threads")
+
+
+        self.is_updating_from_network = False # Flag to prevent echo loop
+
+        self.network_manager = NetworkManager(self) # Initialize NetworkManager
+        self.ai_tools = AITools(self) # Initialize AITools
+
+        # Connect AITools signals to MainWindow slots for execution
+        self.ai_tools.get_current_code_signal.connect(self._ai_handle_get_current_code_request)
+        self.ai_tools.read_file_signal.connect(self._ai_handle_read_file_request)
+        self.ai_tools.write_file_signal.connect(self._ai_handle_write_file_request)
+        self.ai_tools.list_directory_signal.connect(self._ai_handle_list_directory_request)
+
+        # State variables for collaborative editing
+        self.is_host = False
+        self.has_control = False # True if this instance has the editing token
+        self.tab_data_map = {} # Map to store tab-specific data (e.g., file paths)
+
+        self.current_run_mode = "Run" # Initial run mode
+        self.setup_status_bar() # Initialize status bar labels first
+        self.setup_toolbar() # Re-enable toolbar for the new button
+        self.setup_ui()
+        self.setup_menu()
+        self.setup_network_connections() # Setup network signals and slots
+        self.update_ui_for_control_state() # Initial UI update
+        self.load_session() # Load session on startup
+
+    def setup_ui(self):
+        # Central Editor View (QTabWidget)
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.setCentralWidget(self.tab_widget)
+        self.tab_widget.currentChanged.connect(self._update_status_bar_and_language_selector_on_tab_change)
+
+        # File Explorer Panel (Left Sidebar)
+        self.file_explorer_dock = QDockWidget("File Explorer", self)
+        self.file_explorer_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.file_explorer = FileExplorer()
+        self.file_explorer_dock.setWidget(self.file_explorer)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.file_explorer_dock)
+        self.file_explorer.file_opened.connect(self.open_new_tab)
+        self.file_explorer.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_explorer.customContextMenuRequested.connect(self.on_file_tree_context_menu)
+
+        # Integrated Terminal Panel (Bottom Dock)
+        self.terminal_dock = QDockWidget("Output", self)
+        self.terminal_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
         
-        self.run_destination = "Output Panel" 
-        self.runner_config = RUNNER_CONFIG
+        # Create a QTabWidget for the bottom dock
+        self.bottom_tab_widget = QTabWidget()
+        self.terminal_dock.setWidget(self.bottom_tab_widget)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.terminal_dock)
 
-        # Adapt Python configuration to the new nested run/debug structure
-        # This simulates the change in config.py for development within main_window.py
-        if "Python" in self.runner_config:
-            python_config = self.runner_config["Python"]
-            py_executable = sys.executable if sys.executable else "python"
 
-            if isinstance(python_config, list): # Old format: ["python", "{file}"]
-                # self.status_bar.showMessage("Adapting Python runner config to new structure.", 2000) # Status bar not ready yet
-                print("Adapting Python runner config to new structure.")
-                self.runner_config["Python"] = {
-                    "run": [py_executable, "-u", "{file}"], # Using -u for unbuffered output
-                    "debug": [py_executable, "-m", "pdb", "{file}"]
-                }
-            elif isinstance(python_config, dict): # Possibly new format already, or partially new
-                if "run" not in python_config:
-                    python_config["run"] = [py_executable, "-u", "{file}"]
-                if "debug" not in python_config:
-                    python_config["debug"] = [py_executable, "-m", "pdb", "{file}"]
-                # Ensure sys.executable is used in existing run/debug commands if they exist
-                if "run" in python_config and isinstance(python_config["run"], list) and python_config["run"]:
-                    if "python" in python_config["run"][0].lower(): # if command is 'python' or 'python3' etc.
-                        python_config["run"][0] = py_executable
-                if "debug" in python_config and isinstance(python_config["debug"], list) and python_config["debug"]:
-                     if "python" in python_config["debug"][0].lower():
-                        python_config["debug"][0] = py_executable
-            else: # Unknown format for Python
-                # self.status_bar.showMessage("Warning: Python runner config has unexpected format. Defaulting.", 3000)
-                print("Warning: Python runner config has unexpected format. Defaulting.")
-                self.runner_config["Python"] = {
-                    "run": [py_executable, "-u", "{file}"],
-                    "debug": [py_executable, "-m", "pdb", "{file}"]
-                }
-        else: # Python not in config at all
-            # self.status_bar.showMessage("Warning: Python not found in runner_config. Adding default.", 3000)
-            print("Warning: Python not found in runner_config. Adding default.")
-            py_executable = sys.executable if sys.executable else "python"
-            self.runner_config["Python"] = {
-                "run": [py_executable, "-u", "{file}"],
-                "debug": [py_executable, "-m", "pdb", "{file}"]
-            }
+        # Tab 2: Interactive Terminal
+        self.terminal_widget = InteractiveTerminal(self)
+        self.bottom_tab_widget.addTab(self.terminal_widget, "Terminal")
+        
+        # Connect the interactive terminal's command_entered signal
+        self.terminal_widget.line_entered.connect(self._on_terminal_input)
 
-        self.process = None
-        self.current_temp_file_path = None
-        self.current_output_file_path = None
+        # Initial empty tab
+        self.open_new_tab() # This will now correctly set initial tab data
 
-        self.network_manager = NetworkManager(self)
-        self._is_updating_from_network = False
+    def setup_menu(self):
+        menu_bar = self.menuBar()
 
-        # AI Assistant related initializations
-        self.ai_apply_code_signal_emitter = ApplyCodeEditSignal()
-        self.ai_apply_code_signal_emitter.apply_edit_signal.connect(self.handle_apply_code_edit)
-        self.ai_assistant_window_instance = None
+        # File Menu
+        file_menu = menu_bar.addMenu("&File")
+        new_file_action = QAction("&New File", self)
+        new_file_action.setShortcut("Ctrl+N")
+        new_file_action.triggered.connect(self.create_new_file)
+        file_menu.addAction(new_file_action)
 
-        # Attributes for the old run/debug UI (QToolButton with QMenu)
-        # self.current_run_mode = "Run" # Obsolete with ComboBox
-        # self.action_button = None # Obsolete QToolButton
-        # self.dropdown_button = None # Obsolete QToolButton
-        # self.run_debug_menu = None # Obsolete QMenu
-        # self.run_action_menu_item = None # Obsolete QAction
-        # self.debug_action_menu_item = None # Obsolete QAction
-        # self.run_debug_action_group = None # Obsolete QActionGroup
+        save_file_action = QAction("&Save", self)
+        save_file_action.setShortcut("Ctrl+S")
+        save_file_action.triggered.connect(self.save_current_file)
+        file_menu.addAction(save_file_action)
 
-        # New attributes for ComboBox Run/Debug UI
-        self.run_debug_mode_selector = None
-        self.play_action = None
+        save_file_as_action = QAction("Save &As...", self)
+        save_file_as_action.setShortcut("Ctrl+Shift+S")
+        save_file_as_action.triggered.connect(self.save_current_file_as)
+        file_menu.addAction(save_file_as_action)
 
-        self.execute_action = None # For F5 shortcut in menu
+        open_file_action = QAction("&Open File...", self)
+        open_file_action.setShortcut("Ctrl+Shift+O")
+        open_file_action.triggered.connect(self.open_file)
+        file_menu.addAction(open_file_action)
 
+        open_folder_action = QAction("&Open Folder...", self)
+        open_folder_action.setShortcut("Ctrl+O")
+        open_folder_action.triggered.connect(self.open_folder)
+        file_menu.addAction(open_folder_action)
+
+        exit_action = QAction("&Exit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        # Edit Menu
+        edit_menu = menu_bar.addMenu("&Edit")
+        format_code_action = QAction("&Format Code", self)
+        format_code_action.setShortcut("Ctrl+Shift+I")
+        format_code_action.triggered.connect(self.format_current_code)
+        edit_menu.addAction(format_code_action)
+
+        # View Menu (Placeholder for now)
+        view_menu = menu_bar.addMenu("&View")
+
+        # Run Menu
+        run_menu = menu_bar.addMenu("&Run")
+
+        # Run Button in Run Menu (No language selector here anymore)
+
+        # Session Menu
+        session_menu = menu_bar.addMenu("&Session")
+        self.start_host_action = QAction("Start &Hosting Session", self)
+        self.start_host_action.setShortcut("Ctrl+H")
+        self.start_host_action.triggered.connect(self.start_hosting_session)
+        session_menu.addAction(self.start_host_action)
+
+        self.connect_host_action = QAction("&Connect to Host...", self)
+        self.connect_host_action.setShortcut("Ctrl+J")
+        self.connect_host_action.triggered.connect(self.connect_to_host_session)
+        session_menu.addAction(self.connect_host_action)
+
+        self.stop_session_action = QAction("&Stop Current Session", self)
+        self.stop_session_action.setShortcut("Ctrl+T")
+        self.stop_session_action.triggered.connect(self.stop_current_session)
+        session_menu.addAction(self.stop_session_action)
+
+    def setup_toolbar(self):
+        toolbar = self.addToolBar("Main Toolbar")
+        
+        # Run/Debug Dropdown Button
+        # Mode Selector (QComboBox)
+        self.language_selector = QComboBox(self)
+        self.language_selector.addItem("Plain Text") # Default
+        self.language_selector.addItem("Python")
+        self.language_selector.addItem("JavaScript")
+        self.language_selector.addItem("HTML")
+        self.language_selector.addItem("CSS")
+        self.language_selector.addItem("JSON")
+        self.language_selector.setFixedWidth(100) # Adjust width as needed
+        toolbar.addWidget(self.language_selector)
+
+        # Play Button (QAction)
+        self.run_debug_action_button = QAction(QIcon.fromTheme("media-playback-start"), "Run Code", self) # Tooltip updated
+        self.run_debug_action_button.setToolTip("Run Code (F5)")
+        self.run_debug_action_button.setShortcut("F5")
+        self.run_debug_action_button.triggered.connect(self._handle_run_request) # Connect to new handler
+        toolbar.addAction(self.run_debug_action_button)
+
+        # Add other buttons to the toolbar
+        self.request_control_button = QPushButton("Request Control", self)
+        self.request_control_button.clicked.connect(self.request_control)
+        toolbar.addWidget(self.request_control_button)
+        self.request_control_button.setEnabled(False) # Initially disabled
+
+        # AI Assistant Button
+        self.ai_assistant_button = QPushButton("AI Assistant", self)
+        self.ai_assistant_button.setIcon(QIcon.fromTheme("accessories-text-editor")) # Placeholder icon
+        self.ai_assistant_button.clicked.connect(self.open_ai_assistant)
+        toolbar.addWidget(self.ai_assistant_button)
+
+        # New Test Runner Button for diagnostic purposes
+        self.test_runner_button = QPushButton("Test Runner", self)
+        self.test_runner_button.clicked.connect(self._run_diagnostic_test)
+        toolbar.addWidget(self.test_runner_button)
+
+        # Add a permanent widget to the status bar for role/control status
+        self.control_status_label = QLabel("Not in session")
+        self.status_bar.addPermanentWidget(self.control_status_label)
+        
+        # Initial update of the run/debug button
+
+    def setup_status_bar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready.")
+        self.status_bar.showMessage("Ready")
 
-        self._setup_file_explorer_dock() 
-        self._setup_toolbar()    
-        self._setup_output_dock() 
-        self._setup_menus()      
-        self._connect_network_signals()
+        # Status bar labels
+        self.cursor_pos_label = QLabel("Ln 1, Col 1")
+        self.language_label = QLabel("Language: Plain Text")
+        self.git_branch_label = QLabel("Git: N/A") # Placeholder for Git integration
+
+        self.status_bar.addPermanentWidget(self.cursor_pos_label)
+        self.status_bar.addPermanentWidget(self.language_label)
+        self.status_bar.addPermanentWidget(self.git_branch_label)
+
+    def setup_network_connections(self):
+        self.network_manager.data_received.connect(self.on_network_data_received)
+        self.network_manager.status_changed.connect(self.status_bar.showMessage)
+        self.network_manager.peer_connected.connect(self.on_peer_connected)
+        self.network_manager.peer_disconnected.connect(self.on_peer_disconnected)
         
-        self._add_new_editor_tab()
-        # self._update_run_action_button_ui() # Obsolete call
-
-        if self.terminal_panel_te:
-            self.terminal_panel_te.installEventFilter(self)
-
-    @property
-    def current_editor(self) -> CodeEditor | None:
-        return self.editor_tabs.currentWidget()
-
-    def _setup_file_explorer_dock(self):
-        self.file_explorer_dock = QDockWidget("File Explorer", self)
-        self.file_tree_view = QTreeView()
-        self.file_system_model = QFileSystemModel()
-        default_path = QDir.homePath() if QDir.homePath() else QDir.currentPath()
-        self.file_system_model.setRootPath(default_path) 
-        self.file_system_model.setFilter(QDir.NoDotAndDotDot | QDir.AllDirs | QDir.Files)
-        self.file_tree_view.setModel(self.file_system_model)
-        self.file_tree_view.setRootIndex(self.file_system_model.index(default_path))
-        self.file_tree_view.doubleClicked.connect(self._open_file_from_explorer)
-        self.file_tree_view.setAnimated(False)
-        self.file_tree_view.setIndentation(20)
-        self.file_tree_view.setSortingEnabled(True)
-        self.file_tree_view.sortByColumn(0, Qt.AscendingOrder)
-        for i in range(1, self.file_system_model.columnCount()): # Hide all but name
-            self.file_tree_view.setColumnHidden(i, True)
-        self.file_explorer_dock.setWidget(self.file_tree_view)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.file_explorer_dock)
-
-    def _add_new_editor_tab(self, file_path=None, content=""):
-        editor = CodeEditor()
-        highlighter = PythonHighlighter(editor.document())
+        # New signals for control management
+        self.network_manager.control_request_received.connect(self.on_control_request_received)
+        self.network_manager.control_granted.connect(self.on_control_granted)
+        self.network_manager.control_revoked.connect(self.on_control_revoked)
         
-        editor.textChanged.connect(self._on_editor_text_changed_for_network)
-        editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
+        # New signals for control management
+        self.network_manager.control_request_received.connect(self.on_control_request_received)
+        self.network_manager.control_granted.connect(self.on_control_granted)
+        self.network_manager.control_declined.connect(self.on_control_declined) # Connect new signal
+        self.network_manager.control_revoked.connect(self.on_control_revoked)
 
+    EXTENSION_TO_LANGUAGE = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".cpp": "C++",
+        ".cxx": "C++",
+        ".c": "C",
+        ".java": "Java",
+        ".html": "HTML",
+        ".txt": "Plain Text"
+    }
+
+    RUNNER_CONFIG = {
+        "Python": ["python", "-u", "{file}"],
+        "C++": ["g++", "{file}", "-o", "{output_file}", "&&", "{output_file}"],
+        "JavaScript": ["node", "{file}"]
+    }
+
+    def _update_status_bar_and_language_selector_on_tab_change(self, index):
+        editor = self.tab_widget.widget(index)
+        if isinstance(editor, CodeEditor):
+            # Update status bar labels
+            self.language_label.setText(f"Language: {editor.current_language}")
+            self._update_cursor_position_label(editor.textCursor().blockNumber() + 1, editor.textCursor().columnNumber() + 1)
+            
+            # Auto-select language in QComboBox
+            # Get tab data from self.tab_data_map
+            tab_data = self.tab_data_map.get(editor, {}) # Provide default if editor not in map yet
+            file_path = tab_data.get("path") # No 'if tab_data else None' needed due to default
+
+            if file_path:
+                file_extension = os.path.splitext(file_path)[1].lower()
+                detected_language = self.EXTENSION_TO_LANGUAGE.get(file_extension, "Plain Text")
+                idx = self.language_selector.findText(detected_language)
+                if idx != -1:
+                    self.language_selector.setCurrentIndex(idx)
+                else:
+                    default_idx = self.language_selector.findText("Plain Text")
+                    if default_idx != -1:
+                        self.language_selector.setCurrentIndex(default_idx)
+                    elif self.language_selector.count() > 0:
+                        self.language_selector.setCurrentIndex(0)
+            else:
+                default_idx = self.language_selector.findText("Plain Text")
+                if default_idx != -1:
+                    self.language_selector.setCurrentIndex(default_idx)
+                elif self.language_selector.count() > 0:
+                    self.language_selector.setCurrentIndex(0)
+        else:
+            self.language_label.setText("Language: N/A")
+            self.cursor_pos_label.setText("Ln 1, Col 1")
+            default_idx = self.language_selector.findText("Plain Text")
+            if default_idx != -1:
+                self.language_selector.setCurrentIndex(default_idx)
+            elif self.language_selector.count() > 0:
+                self.language_selector.setCurrentIndex(0)
+
+    @Slot()
+    def on_text_editor_changed(self):
+        current_editor = self._get_current_code_editor()
+        if not current_editor:
+            return
+
+        current_index = self.tab_widget.indexOf(current_editor) # Keep for tab title update
+        if current_index == -1:
+            return # Should not happen
+
+        # Get tab_data from the map
+        tab_data = self.tab_data_map.get(current_editor)
+        
+        if not isinstance(tab_data, dict):
+            # Fallback if tab_data is not found or not a dict (should be rare after open_new_tab changes)
+            tab_data = {"path": getattr(current_editor, 'file_path', None), "is_dirty": False}
+            self.tab_data_map[current_editor] = tab_data # Ensure it's in the map
+            # print(f"WARNING: on_text_editor_changed - tab_data was None or not a dict, re-initialized.")
+
+        # Only mark as dirty if the change is not from network update
+        if not self.is_updating_from_network:
+            if not tab_data.get("is_dirty", False):
+                tab_data["is_dirty"] = True # Update the dict in the map by reference
+                # No self.tab_widget.setTabData call needed here.
+                # Add asterisk to tab title
+                current_tab_text = self.tab_widget.tabText(current_index)
+                if not current_tab_text.endswith("*"):
+                    self.tab_widget.setTabText(current_index, current_tab_text + "*")
+            
+            # If in a collaborative session and we have control, send text updates
+            if self.network_manager.is_connected() and self.has_control and not current_editor.isReadOnly():
+                text = current_editor.toPlainText()
+                self.network_manager.send_data('TEXT_UPDATE', text)
+
+    @Slot(str)
+    def on_network_data_received(self, data):
+        print(f"8. Editor update slot called. Received data parameter: {data[:50]}...")
+        current_editor = self._get_current_code_editor() # Use helper
+        if current_editor:
+            try:
+                # The data parameter is already the content string, not the full JSON message.
+                # No need to json.loads() here.
+                content = data
+                print(f"LOG: MainWindow.on_network_data_received - Parsed message in MainWindow: (content directly used)")
+                self.is_updating_from_network = True
+                current_cursor_pos = current_editor.textCursor().position()
+                print(f"LOG: MainWindow.on_network_data_received - Setting text: {content[:50]}...")
+                current_editor.setPlainText(content)
+                cursor = current_editor.textCursor()
+                cursor.setPosition(current_cursor_pos)
+                current_editor.setTextCursor(cursor)
+                self.is_updating_from_network = False
+            except Exception as e:
+                print(f"LOG: MainWindow.on_network_data_received - Error processing received data: {e}")
+        print("LOG: MainWindow.on_network_data_received - Exit")
+
+    @Slot()
+    def on_peer_connected(self):
+        self.status_bar.showMessage("Peer connected!")
+        QMessageBox.information(self, "Connection Status", "Peer connected successfully!")
+        self.start_host_action.setEnabled(False)
+        self.connect_host_action.setEnabled(False)
+        self.stop_session_action.setEnabled(True)
+        self.update_ui_for_control_state() # Update UI after connection
+        print(f"LOG: on_peer_connected - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def on_peer_disconnected(self):
+        self.status_bar.showMessage("Peer disconnected.")
+        QMessageBox.warning(self, "Connection Status", "Peer disconnected.")
+        self.start_host_action.setEnabled(True)
+        self.connect_host_action.setEnabled(True)
+        self.stop_session_action.setEnabled(False)
+        self.is_host = False
+        self.has_control = False
+        self.update_ui_for_control_state() # Reset UI after disconnection
+        print(f"LOG: on_peer_disconnected - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def start_hosting_session(self):
+        ip, port = ConnectionDialog.get_details(self)
+        if ip and port:
+            if self.network_manager.start_hosting(port):
+                self.status_bar.showMessage(f"Hosting on port {port}...")
+                self.start_host_action.setEnabled(False)
+                self.connect_host_action.setEnabled(False)
+                self.stop_session_action.setEnabled(True)
+                self.is_host = True
+                self.has_control = True # Host starts with control
+                self.update_ui_for_control_state()
+                print(f"LOG: start_hosting_session - is_host={self.is_host}, has_control={self.has_control}")
+            else:
+                QMessageBox.critical(self, "Error", "Failed to start hosting session.")
+
+    @Slot()
+    def connect_to_host_session(self):
+        ip, port = ConnectionDialog.get_details(self)
+        if ip and port:
+            self.network_manager.connect_to_host(ip, port)
+            self.status_bar.showMessage(f"Connecting to {ip}:{port}...")
+            self.start_host_action.setEnabled(False)
+            self.connect_host_action.setEnabled(False)
+            self.stop_session_action.setEnabled(True)
+            self.is_host = False
+            self.has_control = False # Client starts without control
+            self.update_ui_for_control_state()
+            print(f"LOG: connect_to_host_session - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def stop_current_session(self):
+        self.network_manager.stop_session()
+        self.status_bar.showMessage("Session stopped.")
+        self.start_host_action.setEnabled(True)
+        self.connect_host_action.setEnabled(True)
+        self.stop_session_action.setEnabled(False)
+        self.is_host = False
+        self.has_control = False
+        self.update_ui_for_control_state() # Reset UI after session stop
+        print(f"LOG: stop_current_session - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot(int, int)
+    def _update_cursor_position_label(self, line, column):
+        self.cursor_pos_label.setText(f"Ln {line}, Col {column}")
+
+    @Slot(str)
+    def _update_language_label(self, language):
+        self.language_label.setText(f"Language: {language}")
+
+    def _get_current_code_editor(self):
+        """Helper to get the current CodeEditor widget, or None if not a CodeEditor."""
+        current_widget = self.tab_widget.currentWidget()
+        if isinstance(current_widget, CodeEditor):
+            return current_widget
+        return None
+
+    # New _handle_run_request method
+    @Slot()
+    def _handle_run_request(self):
+        editor = self._get_current_code_editor()
+        if not editor:
+            self.statusBar().showMessage("No active editor to run.", 3000)
+            return
+
+        if not self.save_current_file(): # save_current_file calls _save_file
+            self.statusBar().showMessage("Save operation cancelled or failed. Run aborted.", 3000)
+            return
+
+        file_path = editor.file_path
+        if not file_path:
+            QMessageBox.warning(self, "Execution Error", "File path not available after save attempt. Cannot execute.")
+            self.statusBar().showMessage("File path error. Run aborted.", 3000)
+            return
+
+        _, extension = os.path.splitext(file_path)
+        language_name = self.EXTENSION_TO_LANGUAGE.get(extension.lower())
+        if not language_name:
+            QMessageBox.warning(self, "Execution Error", f"No language is configured for file type '{extension}'.")
+            return
+
+        command_template = self.RUNNER_CONFIG.get(language_name) # This is now a list
+        if not command_template:
+            QMessageBox.warning(self, "Execution Error", f"No 'run' command is configured for the language '{language_name}'.")
+            return
+
+        # Clear both output panels
+        self.terminal_widget.clear_all()
+        self.statusBar().showMessage(f"Executing '{os.path.basename(file_path)}'...")
+        
+        output_file_no_ext = os.path.splitext(file_path)[0]
+
+        executable = command_template[0]
+        arguments = [part.replace("{file}", file_path).replace("{output_file}", output_file_no_ext) for part in command_template[1:]]
+
+        working_directory = os.path.dirname(file_path)
+
+        # Create and own the QProcess object directly in MainWindow.
+        if hasattr(self, 'process') and self.process is not None:
+            self.process.kill() # Ensure any old process is gone
+        self.process = QProcess(self)
+        
+        # Connect ALL signals for maximum debugging visibility.
+        self.process.readyReadStandardOutput.connect(self._on_process_output)
+        self.process.readyReadStandardError.connect(self._on_process_error_output)
+        self.process.errorOccurred.connect(self._on_process_error)
+        self.process.finished.connect(self._on_process_finished)
+        self.process.started.connect(lambda: print("DEBUG: Signal 'started' was emitted for _handle_run_request."))
+
+        self.process.setWorkingDirectory(working_directory)
+        
+        # Start the process.
+        print(f"DEBUG: Calling QProcess.start() for run request: {executable} {arguments}")
+        self.process.start(executable, arguments)
+        
+        if not self.process.waitForStarted(3000): # Wait up to 3 seconds
+            print("DEBUG: process.waitForStarted() timed out. The process likely failed to launch.")
+            self.terminal_widget.append_output("--- PROCESS FAILED TO START (Timeout) ---\n")
+
+        self.bottom_tab_widget.setCurrentWidget(self.terminal_widget) # Switch to interactive terminal
+        self.terminal_dock.show()
+        self.terminal_dock.raise_()
+
+    @Slot()
+    def _run_diagnostic_test(self):
+        print("--- DEBUG: Starting diagnostic test ---")
+        
+        # 1. Clear the output panel to see the new output clearly.
+        self.terminal_widget.clear_all()
+        self.terminal_widget.append_output("--- Starting Diagnostic Test ---\n")
+
+        # 2. The simplest possible command. This checks if python is in the PATH.
+        #    We are NOT running a file. We are just running the python interpreter.
+        executable = "python"
+        arguments = ["--version"] # A command that prints to stdout and exits.
+        
+        print(f"DEBUG: Hardcoded command: {executable} {' '.join(arguments)}")
+        self.terminal_widget.append_output(f"> {executable} {' '.join(arguments)}\n")
+
+        # 3. Create and own the QProcess object directly in MainWindow.
+        #    This is the most critical part to prevent garbage collection issues.
+        if hasattr(self, 'process') and self.process is not None:
+            self.process.kill() # Ensure any old process is gone
+        self.process = QProcess(self)
+        
+        # 4. Connect ALL signals for maximum debugging visibility.
+        self.process.readyReadStandardOutput.connect(self._on_process_output)
+        self.process.readyReadStandardError.connect(self._on_process_error_output)
+        self.process.errorOccurred.connect(self._on_process_error)
+        self.process.finished.connect(self._on_process_finished)
+        self.process.started.connect(lambda: print("DEBUG: Signal 'started' was emitted for diagnostic test."))
+
+        # 5. Start the process.
+        print("DEBUG: Calling QProcess.start()...")
+        self.process.start(executable, arguments)
+        
+        if not self.process.waitForStarted(3000): # Wait up to 3 seconds
+            print("DEBUG: process.waitForStarted() timed out. The process likely failed to launch.")
+            self.terminal_widget.append_output("--- PROCESS FAILED TO START (Timeout) ---\n")
+
+        self.bottom_tab_widget.setCurrentWidget(self.terminal_widget) # Switch to interactive terminal
+
+    @Slot(str)
+    def _on_terminal_input(self, command):
+        # Append the command to the terminal output to show what was typed
+        self.terminal_widget.append_output(f"> {command}\n")
+        if self.process and self.process.state() == QProcess.Running:
+            self.process.write(f"{command}\n".encode())
+            print(f"DEBUG: Sent to process: {command}")
+        else:
+            self.terminal_widget.append_output("Error: No process is running to receive input.\n")
+
+    @Slot()
+    def _on_process_output(self):
+        data = self.process.readAllStandardOutput().data().decode(sys.getfilesystemencoding(), errors='ignore')
+        self.terminal_widget.append_output(data)
+
+    @Slot()
+    def _on_process_error_output(self):
+        error_output = self.process.readAllStandardError().data().decode(errors='ignore')
+        print(f"DEBUG: _on_process_error_output received:\n{error_output}")
+        self.terminal_widget.append_output(f"STDERR: {error_output}")
+
+    @Slot(int, QProcess.ExitStatus)
+    def _on_process_finished(self, exit_code, exit_status):
+        status = "crashed" if exit_status == QProcess.CrashExit else "finished"
+        print(f"DEBUG: Signal 'finished' was emitted. Code: {exit_code}, Status: {status}")
+        self.terminal_widget.append_output(f"\n--- Process {status} with exit code {exit_code} ---\n")
+
+    @Slot(QProcess.ProcessError)
+    def _on_process_error(self, error):
+        error_string = self.process.errorString()
+        print(f"DEBUG: Signal 'errorOccurred' was emitted. Error: {error_string}")
+        self.terminal_widget.append_output(f"\n--- PROCESS ERROR ---\n{error_string}\n")
+
+    def update_editor_read_only_state(self):
+        current_editor = self._get_current_code_editor()
+        if current_editor:
+            if self.network_manager.is_connected():
+                # Editor is read-only if we don't have control in a session
+                current_editor.setReadOnly(not self.has_control)
+            else:
+                # If not in a session, editor is always writable
+                current_editor.setReadOnly(False)
+
+    def update_ui_for_control_state(self):
+        # Update status bar message
+        if self.network_manager.is_connected():
+            if self.is_host:
+                if self.has_control:
+                    self.control_status_label.setText("You have editing control.")
+                else:
+                    self.control_status_label.setText("Viewer has control. Press any key to reclaim.")
+            else: # Client
+                if self.has_control:
+                    self.control_status_label.setText("You have editing control.")
+                else:
+                    self.control_status_label.setText("Viewing only. Click 'Request Control' to edit.")
+        else:
+            self.control_status_label.setText("Not in session")
+
+        # Update "Request Control" button state
+        if self.network_manager.is_connected() and not self.is_host:
+            self.request_control_button.setEnabled(not self.has_control)
+        else:
+            self.request_control_button.setEnabled(False) # Only client can request control
+
+        # Update editor read-only state
+        self.update_editor_read_only_state()
+        print(f"LOG: update_ui_for_control_state - is_host={self.is_host}, has_control={self.has_control}, editor_read_only={self._get_current_code_editor().isReadOnly() if self._get_current_code_editor() else 'N/A'}")
+
+    @Slot()
+    def request_control(self):
+        if not self.is_host and not self.has_control and self.network_manager.is_connected():
+            self.network_manager.send_data('REQ_CONTROL')
+            self.status_bar.showMessage("Requesting control...")
+            self.request_control_button.setEnabled(False) # Disable button after request
+            print(f"LOG: request_control - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def on_control_request_received(self):
+        if self.is_host and self.has_control: # Host has control and client requests it
+            reply = QMessageBox.question(self, "Control Request",
+                                         "The client has requested editing control. Grant control?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.network_manager.send_data('GRANT_CONTROL')
+                self.has_control = False
+                self.update_ui_for_control_state()
+                self.status_bar.showMessage("Control granted to client.")
+            else:
+                self.network_manager.send_data('DECLINE_CONTROL')
+                self.status_bar.showMessage("Control request declined.")
+
+    @Slot()
+    def on_control_granted(self):
+        if not self.is_host: # Only client receives this
+            self.has_control = True
+            self.update_ui_for_control_state()
+            self.status_bar.showMessage("You have been granted editing control.")
+            print(f"LOG: on_control_granted - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def on_control_declined(self):
+        if not self.is_host: # Only client receives this
+            self.status_bar.showMessage("Host declined the request.", 3000) # Show for 3 seconds
+            self.request_control_button.setEnabled(True) # Re-enable button
+
+    @Slot()
+    def on_control_revoked(self):
+        if not self.is_host: # Only client receives this
+            self.has_control = False
+            self.update_ui_for_control_state()
+            self.status_bar.showMessage("Editing control has been revoked.")
+            print(f"LOG: on_control_revoked - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def on_host_reclaim_control(self):
+        if self.is_host and not self.has_control: # Host reclaims control
+            self.has_control = True
+            self.update_ui_for_control_state()
+            self.network_manager.send_data('REVOKE_CONTROL')
+            self.status_bar.showMessage("You have reclaimed editing control.")
+            print(f"LOG: on_host_reclaim_control - is_host={self.is_host}, has_control={self.has_control}")
+
+    @Slot()
+    def _ai_handle_get_current_code_request(self):
+        """Handles requests from AITools to get the current code in the active editor."""
+        current_editor = self._get_current_code_editor()
+        if current_editor:
+            code = current_editor.toPlainText()
+            self.ai_get_current_code_result.emit(code)
+            print("LOG: _ai_handle_get_current_code_request - Emitted current code.")
+        else:
+            self.ai_get_current_code_result.emit("") # Emit empty string if no editor
+            print("LOG: _ai_handle_get_current_code_request - No active editor, emitted empty string.")
+
+    def open_new_tab(self, file_path=None):
+        editor = CodeEditor(self)
         tab_title = "Untitled"
+        tab_data = {"path": None, "is_dirty": False} # Initialize tab state
+
         if file_path:
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 editor.setPlainText(content)
-                tab_title = QFileInfo(file_path).fileName()
-                editor.setProperty("file_path", file_path)
-                editor.document().setModified(False) 
+                tab_title = os.path.basename(file_path) # Get filename
+                editor.file_path = file_path # Store file path in editor widget
+                tab_data["path"] = file_path # Set path for existing file
+            except FileNotFoundError:
+                QMessageBox.critical(self, "Error", f"File not found: '{file_path}'")
+                editor.deleteLater() # Clean up the editor if file not found
+                return
+            except PermissionError:
+                QMessageBox.critical(self, "Error", f"Permission denied to open: '{file_path}'")
+                editor.deleteLater()
+                return
+            except UnicodeDecodeError:
+                QMessageBox.critical(self, "Error", f"Could not open '{file_path}'. It might be a binary file or use an unsupported encoding.")
+                editor.deleteLater()
+                return
             except Exception as e:
-                QMessageBox.warning(self, "Error Opening File", f"Could not open file: {file_path}\n{e}")
-                content = f"# Error opening {file_path}\n{e}"
-                editor.setPlainText(content)
-                tab_title = "Error"
-                editor.setProperty("file_path", None)
-                editor.document().setModified(False)
+                QMessageBox.critical(self, "Error", f"An unexpected error occurred while opening '{file_path}': {e}")
+                editor.deleteLater()
+                return
         else:
-            editor.setPlainText(content)
-            MainWindow.untitled_tab_counter += 1
-            tab_title = f"Untitled-{MainWindow.untitled_tab_counter}"
-            editor.setProperty("file_path", None)
-            editor.document().setModified(False)
+            editor.file_path = None # For new untitled files
 
-        index = self.editor_tabs.addTab(editor, tab_title)
-        self.editor_tabs.setCurrentIndex(index)
-        editor.setFocus()
-        self._update_window_title()
+        index = self.tab_widget.addTab(editor, tab_title)
+        # self.tab_data_map[editor] = tab_data # Store tab state - MOVED, ALREADY PRESENT
+        self.tab_widget.setCurrentIndex(index)
+        self.tab_widget.setTabToolTip(index, file_path if file_path else "Untitled") # Set tooltip to full path
+        self.tab_data_map[editor] = tab_data # Store tab_data in the map
 
-    def _close_editor_tab(self, index):
-        editor_widget = self.editor_tabs.widget(index)
-        if editor_widget:
-            if editor_widget.document().isModified():
-                self.editor_tabs.setCurrentIndex(index)
-                reply = QMessageBox.question(self, "Unsaved Changes",
-                                             f"'{self.editor_tabs.tabText(index).replace('*','')}*' has unsaved changes. Save before closing?",
-                                             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                                             QMessageBox.Cancel)
-                if reply == QMessageBox.Cancel:
-                    return
-                if reply == QMessageBox.Save:
-                    if not self._save_current_file():
-                        return 
-            
-            try: editor_widget.textChanged.disconnect(self._on_editor_text_changed_for_network)
-            except RuntimeError: pass
-            try: editor_widget.document().modificationChanged.disconnect(self._update_window_title_and_tab_text)
-            except RuntimeError: pass
-
-            self.editor_tabs.removeTab(index)
-            editor_widget.deleteLater()
-        
-        if self.editor_tabs.count() == 0:
-            self._add_new_editor_tab()
-        else:
-            self._update_window_title()
-
-
-    def _open_file_from_explorer(self, index):
-        file_path = self.file_system_model.filePath(index)
-        if QFileInfo(file_path).isFile():
-            for i in range(self.editor_tabs.count()):
-                editor = self.editor_tabs.widget(i)
-                if editor and editor.property("file_path") == file_path:
-                    self.editor_tabs.setCurrentIndex(i)
-                    return
-            self._add_new_editor_tab(file_path=file_path)
-
-    def _open_file_dialog(self):
-        start_dir = QDir.currentPath() 
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open File", start_dir, "All Files (*);;Text Files (*.txt);;Python Files (*.py)")
-        if file_path:
-            for i in range(self.editor_tabs.count()):
-                editor = self.editor_tabs.widget(i)
-                if editor and editor.property("file_path") == file_path:
-                    self.editor_tabs.setCurrentIndex(i)
-                    return
-            self._add_new_editor_tab(file_path=file_path)
-
-    def _save_current_file(self):
-        editor = self.current_editor
-        if not editor: return False
-        file_path = editor.property("file_path")
-        if file_path:
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(editor.toPlainText())
-                self.status_bar.showMessage(f"File saved: {file_path}", 3000)
-                editor.document().setModified(False)
-                self._update_window_title_and_tab_text(False)
-                return True
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", f"Could not save file: {file_path}\n{e}")
-                self.status_bar.showMessage(f"Error saving file: {e}", 5000)
-                return False
-        else:
-            return self._save_current_file_as()
-
-    def _save_current_file_as(self):
-        editor = self.current_editor
-        if not editor: return False
-        
-        current_path = editor.property("file_path") or QDir.currentPath()
-        suggested_name = self.editor_tabs.tabText(self.editor_tabs.currentIndex()).replace("*","") if not editor.property("file_path") else current_path
-
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save File As...", suggested_name, "All Files (*);;Text Files (*.txt);;Python Files (*.py)")
-        if file_path:
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(editor.toPlainText())
-                editor.setProperty("file_path", file_path)
-                current_idx = self.editor_tabs.currentIndex()
-                self.editor_tabs.setTabText(current_idx, QFileInfo(file_path).fileName())
-                editor.document().setModified(False)
-                self._update_window_title_and_tab_text(False)
-                self.status_bar.showMessage(f"File saved as: {file_path}", 3000)
-                return True
-            except Exception as e:
-                QMessageBox.critical(self, "Save As Error", f"Could not save file: {file_path}\n{e}")
-                self.status_bar.showMessage(f"Error saving file as: {e}", 5000)
-                return False
-        return False
-
-
-    def _on_current_tab_changed(self, index):
-        for i in range(self.editor_tabs.count()):
-            editor = self.editor_tabs.widget(i)
-            if editor:
-                try: editor.textChanged.disconnect(self._on_editor_text_changed_for_network)
-                except RuntimeError: pass
-                doc = editor.document()
-                if doc:
-                    try: doc.modificationChanged.disconnect(self._update_window_title_and_tab_text)
-                    except RuntimeError: pass
-        
-        if index != -1 :
-            current_editor = self.current_editor
-            if current_editor:
-                current_editor.textChanged.connect(self._on_editor_text_changed_for_network)
-                current_editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
-        
-        self._update_window_title()
-
-
-    def _update_window_title(self):
-        base_title = "Code-Sync IDE"
-        editor = self.current_editor
-        if editor:
-            tab_index = self.editor_tabs.currentIndex()
-            file_path = editor.property("file_path")
-            tab_text = QFileInfo(file_path).fileName() if file_path else self.editor_tabs.tabText(tab_index).replace("*","")
-            
-            if editor.document().isModified():
-                tab_text += "*"
-            
-            self.setWindowTitle(f"{tab_text} - {base_title}")
-        elif self.editor_tabs.count() == 0:
-             self.setWindowTitle(base_title)
-    
-    def _update_window_title_and_tab_text(self, modified):
-        editor_doc = self.sender()
-        if not editor_doc: return
-
-        for i in range(self.editor_tabs.count()):
-            editor = self.editor_tabs.widget(i)
-            if editor and editor.document() == editor_doc:
-                file_path = editor.property("file_path")
-                base_name = QFileInfo(file_path).fileName() if file_path else self.editor_tabs.tabText(i).replace("*", "")
-                
-                if not file_path:
-                    if not base_name or base_name == "*": 
-                         current_tab_text_no_star = self.editor_tabs.tabText(i).replace("*","")
-                         base_name = current_tab_text_no_star
-
-                new_tab_text = base_name + ("*" if modified else "")
-                self.editor_tabs.setTabText(i, new_tab_text)
-                
-                if i == self.editor_tabs.currentIndex():
-                    self._update_window_title()
-                break
-
-
-    def _setup_toolbar(self):
-        toolbar = QToolBar("Execution Toolbar")
-        self.addToolBar(toolbar)
-        self.language_selector = QComboBox()
-        self.language_selector.addItems(self.runner_config.keys())
-        toolbar.addWidget(self.language_selector)
-
-        # Mode Selector ComboBox
-        self.run_debug_mode_selector = QComboBox()
-        self.run_debug_mode_selector.addItems(["Run", "Debug"])
-        self.run_debug_mode_selector.setFixedWidth(100)
-        self.run_debug_mode_selector.setToolTip("Select execution mode (Run or Debug)")
-        toolbar.addWidget(self.run_debug_mode_selector)
-
-        # Play Action Button
-        self.play_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "Execute", self)
-        self.play_action.setToolTip("Execute (Run/Debug based on selected mode) (F5)")
-        toolbar.addAction(self.play_action)
-        self.play_action.triggered.connect(self.handle_execution)
-
-    @Slot()
-    def handle_execution(self):
-        if not self.run_debug_mode_selector:
-            QMessageBox.critical(self, "Error", "Run/Debug mode selector not found.")
-            return
-
-        mode_text = self.run_debug_mode_selector.currentText().lower()
-        self._execute_code_from_config(mode=mode_text)
-
-    # @Slot() # Obsolete: Was connected to the old QToolButton UI
-    # def _on_main_action_button_clicked(self):
-    #     pass
-
-    # @Slot() # Obsolete: Logic merged into _execute_code_from_config
-    # def _debug_code(self):
-    #     pass
+        # Connect signals from the new editor to update status bar
+        editor.cursor_position_changed_signal.connect(self._update_cursor_position_label)
+        editor.language_changed_signal.connect(self._update_language_label)
+        editor.textChanged.connect(self.on_text_editor_changed) # Connect for network sync
+        editor.control_reclaim_requested.connect(self.on_host_reclaim_control) # Connect new signal
+        self._update_status_bar_and_language_selector_on_tab_change(index) # Update status bar immediately for new tab
+        self.update_editor_read_only_state() # Apply initial read-only state
 
     @Slot(str)
-    def _execute_code_from_config(self, mode: str):
-        editor = self.current_editor
-        if not editor:
-            self.status_bar.showMessage(f"No active editor to {mode}.", 3000)
-            return
+    def _ai_handle_read_file_request(self, file_path):
+        """Handles requests from AITools to read a file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.ai_read_file_result.emit(file_path, content)
+            print(f"LOG: _ai_handle_read_file_request - Read file: {file_path}")
+        except FileNotFoundError:
+            self.ai_read_file_result.emit(file_path, f"Error: File not found at {file_path}")
+            print(f"LOG: _ai_handle_read_file_request - File not found: {file_path}")
+        except Exception as e:
+            self.ai_read_file_result.emit(file_path, f"Error reading file {file_path}: {e}")
+            print(f"LOG: _ai_handle_read_file_request - Error reading file {file_path}: {e}")
 
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
-            reply = QMessageBox.question(self, "Process Running",
-                                         f"A process is already running. Stop it to start {mode}?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                         QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.process.kill()
-                self.process.waitForFinished(1000)
-            else:
-                self.status_bar.showMessage(f"{mode.capitalize()} cancelled as another process is running.", 3000)
-                return
+    @Slot(str, str)
+    def _ai_handle_write_file_request(self, file_path, content):
+        """Handles requests from AITools to write content to a file."""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.ai_write_file_result.emit(file_path, True, "File written successfully.")
+            print(f"LOG: _ai_handle_write_file_request - Wrote to file: {file_path}")
+        except Exception as e:
+            self.ai_write_file_result.emit(file_path, False, f"Error writing to file {file_path}: {e}")
+            print(f"LOG: _ai_handle_write_file_request - Error writing to file {file_path}: {e}")
 
-        code = editor.toPlainText()
-        if not code.strip():
-            self.status_bar.showMessage(f"No code to {mode}.", 3000)
-            return
-
-        self.status_bar.showMessage(f"Preparing to {mode} code...", 2000)
-
-        selected_language = self.language_selector.currentText()
-        lang_configs_for_ide = self.runner_config
-
-        if selected_language not in lang_configs_for_ide:
-            self.status_bar.showMessage(f"Language '{selected_language}' not configured.", 5000)
-            return
-
-        current_lang_specific_config = lang_configs_for_ide[selected_language]
-
-        if not isinstance(current_lang_specific_config, dict) or \
-           mode not in current_lang_specific_config or \
-           not isinstance(current_lang_specific_config[mode], list):
-            self.status_bar.showMessage(f"'{mode}' command not configured for '{selected_language}'.", 5000)
-            if mode != "run" and "run" in current_lang_specific_config and isinstance(current_lang_specific_config["run"], list):
-                 self.status_bar.showMessage(f"Falling back to 'run' mode for '{selected_language}'.", 3000)
-                 mode = "run"
-                 command_template = current_lang_specific_config[mode]
-            else:
-                return
-        else:
-            command_template = current_lang_specific_config[mode]
-
-        if mode == "debug":
-            if selected_language != "Python":
-                QMessageBox.warning(self, "Language Mismatch",
-                                    "Debugging with PDB currently only supports Python. Please select Python as the language.")
-                py_idx = self.language_selector.findText("Python")
-                if py_idx != -1:
-                    self.language_selector.setCurrentIndex(py_idx)
+    @Slot(str)
+    def _ai_handle_list_directory_request(self, path):
+        """Handles requests from AITools to list directory contents."""
+        try:
+            contents = []
+            for item in os.listdir(path):
+                full_path = os.path.join(path, item)
+                if os.path.isdir(full_path):
+                    contents.append({"name": item, "type": "directory"})
                 else:
-                    self.status_bar.showMessage("Python language configuration not found for debugging.", 5000)
-                    return
-                current_lang_specific_config = lang_configs_for_ide["Python"] # Re-fetch after potential lang change
-                if mode not in current_lang_specific_config or not isinstance(current_lang_specific_config[mode], list):
-                     self.status_bar.showMessage(f"'{mode}' command not configured for 'Python' after switch.", 5000)
-                     return
-                command_template = current_lang_specific_config[mode]
-
-            self._set_run_destination("Terminal")
-            self.output_tabs.setCurrentWidget(self.terminal_panel_te)
-            self.terminal_panel_te.clear()
-            self.terminal_panel_te.setFocus()
-            self.status_bar.showMessage("Starting debug session in terminal...", 2000)
-        else: # 'run' mode
-            if self.run_destination == "Output Panel":
-                self.output_tabs.setCurrentWidget(self.output_panel_te)
-                self.output_panel_te.clear()
-            else:
-                self.output_tabs.setCurrentWidget(self.terminal_panel_te)
-                self.terminal_panel_te.clear()
-
-        self._cleanup_temp_files()
-        temp_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or tempfile.gettempdir()
-
-        lang_ext = ".py"
-        if isinstance(lang_configs_for_ide.get(selected_language), dict) and \
-           isinstance(lang_configs_for_ide[selected_language].get("ext"), str):
-            lang_ext = lang_configs_for_ide[selected_language]["ext"]
-        elif selected_language == "Python":
-            lang_ext = ".py"
-        else:
-            lang_ext = ".tmp"
-
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=lang_ext, delete=False, encoding='utf-8', dir=temp_dir) as tf:
-                self.current_temp_file_path = tf.name
-                tf.write(code)
+                    contents.append({"name": item, "type": "file"})
+            self.ai_list_directory_result.emit(path, json.dumps(contents))
+            print(f"LOG: _ai_handle_list_directory_request - Listed directory: {path}")
+        except FileNotFoundError:
+            self.ai_list_directory_result.emit(path, f"Error: Directory not found at {path}")
+            print(f"LOG: _ai_handle_list_directory_request - Directory not found: {path}")
         except Exception as e:
-            self.status_bar.showMessage(f"Error creating temp file for {mode}: {e}", 5000)
-            return
+            self.ai_list_directory_result.emit(path, f"Error listing directory {path}: {e}")
+            print(f"LOG: _ai_handle_list_directory_request - Error listing directory {path}: {e}")
 
-        processed_command = []
-        file_info = QFileInfo(self.current_temp_file_path)
-        file_dir = file_info.absolutePath()
-        file_name_no_ext = file_info.completeBaseName()
-        self.current_output_file_path = os.path.join(temp_dir, file_name_no_ext) if current_lang_specific_config.get("output_based") else None
+    def open_folder(self):
+        dialog = QFileDialog(self)
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        if dialog.exec():
+            selected_directory = dialog.selectedFiles()[0]
+            self.file_explorer.set_root_path(selected_directory)
+            self.status_bar.showMessage(f"Opened folder: {selected_directory}")
 
-        for part in list(command_template):
-            part = part.replace("{file}", self.current_temp_file_path)
-            part = part.replace("{dir}", file_dir)
-            part = part.replace("{class_name}", file_name_no_ext)
-            if self.current_output_file_path:
-                 part = part.replace("{output_file_no_ext}", self.current_output_file_path)
-            processed_command.append(part)
-
-        log_message = f"Executing ({mode}): {' '.join(processed_command)}\n---"
-        if self.run_destination == "Output Panel" and mode == "run":
-            self.output_panel_te.appendPlainText(log_message)
+    def close_tab(self, index=None): # Made index optional as per later definition
+        if index is None:
+            index_to_close = self.tab_widget.currentIndex()
         else:
-            self.terminal_panel_te.appendPlainText(log_message)
-
-        self.process = QProcess(self)
-        self.process.setWorkingDirectory(file_dir)
-        self.process.readyReadStandardOutput.connect(self._handle_process_output)
-        self.process.readyReadStandardError.connect(self._handle_process_error)
-        self.process.finished.connect(self._handle_process_finished)
-        self.process.errorOccurred.connect(self._handle_process_qprocess_error)
-
-        if sys.platform != "win32" and mode == "debug":
-             self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-
-        self.process.start(processed_command[0], processed_command[1:])
-
-        if not self.process.waitForStarted(3000 if mode == "debug" else 2000):
-            err_msg = self.process.errorString()
-            self._append_to_output_or_terminal(f"Error starting process for {mode}: {err_msg}\n", is_error=True)
-            self._handle_process_finished(-1, QProcess.ProcessError.FailedToStart)
-
-    @Slot()
-    def _update_run_action_button_ui(self):
-        # This method is part of the old UI and will be removed or heavily refactored.
-        # For now, it might try to access self.action_button which is None from __init__.
-        # if hasattr(self, 'action_button') and self.action_button:
-        #     if hasattr(self, 'current_run_mode') and self.current_run_mode == "Run":
-        #          self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        #          self.action_button.setToolTip("Run current script (F5)")
-        #     else:
-        #          self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
-        #          self.action_button.setToolTip("Debug current script (F5)")
-        pass # Body replaced with pass as it's obsolete
-
-    @Slot()
-    def _set_run_mode_run(self):
-        # This method is part of the old UI and will be removed.
-        # self.current_run_mode = "Run"
-        # if self.run_action_menu_item and not self.run_action_menu_item.isChecked():
-        #      self.run_action_menu_item.setChecked(True)
-        # self._update_run_action_button_ui()
-        # self.status_bar.showMessage("Switched to Run mode.", 2000)
-        pass # Body replaced with pass as it's obsolete
-
-    @Slot()
-    def _set_run_mode_debug(self):
-        # This method is part of the old UI and will be removed.
-        # self.current_run_mode = "Debug"
-        # if self.debug_action_menu_item and not self.debug_action_menu_item.isChecked():
-        #     self.debug_action_menu_item.setChecked(True)
-        # self._update_run_action_button_ui()
-        # self.status_bar.showMessage("Switched to Debug mode.", 2000)
-        pass # Body replaced with pass as it's obsolete
-
-    def _setup_output_dock(self):
-        self.output_dock = QDockWidget("Output / Terminal", self)
-        self.output_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
-        self.output_dock.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.output_tabs = QTabWidget()
-        self.output_tabs.setMinimumHeight(150)
-        self.output_panel_te = QPlainTextEdit()
-        self.output_panel_te.setReadOnly(True)
-        self.output_tabs.addTab(self.output_panel_te, "Output")
-        self.terminal_panel_te = QPlainTextEdit()
-        term_font = QFont("Courier New", 10)
-        if sys.platform == "darwin": term_font.setFamily("Monaco")
-        elif sys.platform == "win32": term_font.setFamily("Consolas")
-        else: term_font.setFamily("Monospace") 
-        self.terminal_panel_te.setFont(term_font)
-        self.terminal_panel_te.setStyleSheet("background-color: #2E2E2E; color: #E0E0E0; padding: 5px;")
-        self.output_tabs.addTab(self.terminal_panel_te, "Terminal")
-        self.output_dock.setWidget(self.output_tabs)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.output_dock)
-
-    def _setup_menus(self):
-        self.menu_bar = self.menuBar()
-        file_menu = self.menu_bar.addMenu("&File")
-        new_file_action = QAction(QIcon.fromTheme("document-new", QIcon()), "&New File", self)
-        new_file_action.setShortcut(QKeySequence.New)
-        new_file_action.triggered.connect(self._create_new_file_context_aware) # Changed connection
-        file_menu.addAction(new_file_action)
-        open_file_action = QAction(QIcon.fromTheme("document-open", QIcon()), "&Open File...", self)
-        open_file_action.setShortcut(QKeySequence.Open)
-        open_file_action.triggered.connect(self._open_file_dialog)
-        file_menu.addAction(open_file_action)
-        self.save_file_action = QAction(QIcon.fromTheme("document-save", QIcon()), "&Save File", self)
-        self.save_file_action.setShortcut(QKeySequence.Save)
-        self.save_file_action.triggered.connect(self._save_current_file)
-        file_menu.addAction(self.save_file_action)
-        self.save_as_action = QAction(QIcon.fromTheme("document-save-as", QIcon()), "Save File &As...", self)
-        self.save_as_action.setShortcut(QKeySequence.SaveAs)
-        self.save_as_action.triggered.connect(self._save_current_file_as)
-        file_menu.addAction(self.save_as_action)
+            index_to_close = index
         
-        session_menu = self.menu_bar.addMenu("&Session")
-        self.start_hosting_action = QAction("&Start Hosting Session", self)
-        self.start_hosting_action.setShortcut(QKeySequence("Ctrl+H"))
-        self.start_hosting_action.triggered.connect(self._start_hosting_session)
-        session_menu.addAction(self.start_hosting_action)
-        self.connect_to_host_action = QAction("&Connect to Host...", self)
-        self.connect_to_host_action.setShortcut(QKeySequence("Ctrl+J"))
-        self.connect_to_host_action.triggered.connect(self._connect_to_host_session)
-        session_menu.addAction(self.connect_to_host_action)
-        self.stop_session_action = QAction("S&top Current Session", self)
-        self.stop_session_action.setShortcut(QKeySequence("Ctrl+T"))
-        self.stop_session_action.triggered.connect(self._stop_current_session)
-        self.stop_session_action.setEnabled(False)
-        session_menu.addAction(self.stop_session_action)
-
-        edit_menu = self.menu_bar.addMenu("&Edit")
-        self.format_code_action = QAction("&Format Code", self)
-        self.format_code_action.setShortcut(QKeySequence("Ctrl+Alt+L"))
-        self.format_code_action.triggered.connect(self._format_code)
-        edit_menu.addAction(self.format_code_action)
-
-        run_menu = self.menu_bar.addMenu("&Run")
-        # run_menu.addAction(self.run_action) # Old run_action removed from menu
-        # self.run_action.setShortcut(QKeySequence("F5")) # Shortcut will be handled differently
-        run_menu.addSeparator()
-
-        # Add a general "Execute" action that respects the current Run/Debug mode
-        self.execute_action = QAction("Execute (Run/Debug)", self)
-        self.execute_action.setShortcut(QKeySequence("F5"))
-        try:
-            self.execute_action.triggered.disconnect()
-        except (RuntimeError, TypeError):
-            pass # No connections or slot was C++
-        self.execute_action.triggered.connect(self.handle_execution) # Connect to the new unified handler
-        run_menu.addAction(self.execute_action) # Add it to the Run menu
-
-        run_destination_group = QActionGroup(self)
-        run_destination_group.setExclusive(True)
-        self.output_dest_action = QAction("Output Panel", self, checkable=True)
-        self.output_dest_action.setChecked(self.run_destination == "Output Panel")
-        self.output_dest_action.triggered.connect(lambda: self._set_run_destination("Output Panel"))
-        run_menu.addAction(self.output_dest_action)
-        run_destination_group.addAction(self.output_dest_action)
-        self.terminal_dest_action = QAction("Integrated Terminal", self, checkable=True)
-        self.terminal_dest_action.setChecked(self.run_destination == "Terminal")
-        self.terminal_dest_action.triggered.connect(lambda: self._set_run_destination("Terminal"))
-        run_menu.addAction(self.terminal_dest_action)
-        run_destination_group.addAction(self.terminal_dest_action)
-
-        # Tools Menu
-        tools_menu = self.menu_bar.addMenu("&Tools")
-        ai_assistant_action = QAction("AI Assistant", self)
-        ai_assistant_action.setShortcut(QKeySequence("Ctrl+Shift+A")) # Optional: add a shortcut
-        ai_assistant_action.triggered.connect(self.show_ai_assistant)
-        tools_menu.addAction(ai_assistant_action)
-
-    def _set_run_destination(self, destination: str):
-        self.run_destination = destination
-        if destination == "Output Panel": self.output_dest_action.setChecked(True)
-        elif destination == "Terminal": self.terminal_dest_action.setChecked(True)
-        self.status_bar.showMessage(f"Run destination set to: {destination}", 2000)
-
-    # def _trigger_run_code(self): # Obsolete
-    #     pass
-
-    # def _execute_current_code(self): # Obsolete
-    #     pass
-
-    def _handle_process_output(self):
-        if not self.process: return
-        data = self.process.readAllStandardOutput().data().decode(errors='replace')
-        self._append_to_output_or_terminal(data)
-
-    def _handle_process_error(self):
-        if not self.process: return
-        data = self.process.readAllStandardError().data().decode(errors='replace')
-        self._append_to_output_or_terminal(data, is_error=True)
-
-    def _append_to_output_or_terminal(self, text: str, is_error: bool = False):
-        target_panel = self.output_panel_te if self.run_destination == "Output Panel" else self.terminal_panel_te
-        target_panel.insertPlainText(text)
-
-    @Slot(QProcess.ProcessError)
-    def _handle_process_qprocess_error(self, error):
-        error_messages = {
-            QProcess.ProcessError.FailedToStart: "Failed to start: The process failed to start. Check if the command or executable path is correct and if you have permissions.",
-            QProcess.ProcessError.Crashed: "Crashed: The process crashed some time after starting successfully.",
-            QProcess.ProcessError.Timedout: "Timed out: The last waitFor...() function timed out. The state of QProcess is unchanged.",
-            QProcess.ProcessError.ReadError: "Read Error: An error occurred when attempting to read from the process.",
-            QProcess.ProcessError.WriteError: "Write Error: An error occurred when attempting to write to the process.",
-            QProcess.ProcessError.UnknownError: "Unknown Error: An unknown error occurred."
-        }
-        error_message = error_messages.get(error, f"An unspecified QProcess error occurred: {error}")
-        self._append_to_output_or_terminal(f"QProcess Error: {error_message}\n", is_error=True)
-        # Optionally, also call _handle_process_finished or update UI to reflect error state
-        # For now, just logging. If the process finishes due to this, finished signal will also trigger.
-        if self.process and self.process.state() == QProcess.NotRunning:
-             self._handle_process_finished(self.process.exitCode(), QProcess.CrashExit) # Assuming crash if error leads to not running
-
-    def _handle_process_finished(self, exit_code, exit_status):
-        status_msg = f"\n--- Process finished with exit code {exit_code}."
-        if exit_status == QProcess.CrashExit: status_msg += " (Crashed)"
-        elif exit_status == QProcess.NormalExit: status_msg += " (Normal Exit)"
-        self._append_to_output_or_terminal(status_msg)
-        if self.process: self.process.deleteLater()
-        self.process = None
-
-    def _cleanup_temp_files(self):
-        if self.current_temp_file_path and os.path.exists(self.current_temp_file_path):
-            try: os.remove(self.current_temp_file_path)
-            except OSError as e: print(f"Error removing temp file {self.current_temp_file_path}: {e}")
-        self.current_temp_file_path = None
-        if self.current_output_file_path and os.path.exists(self.current_output_file_path):
-            try: os.remove(self.current_output_file_path)
-            except OSError as e: print(f"Error removing output file {self.current_output_file_path}: {e}")
-        if self.current_output_file_path and sys.platform == "win32" and os.path.exists(self.current_output_file_path + ".exe"):
-            try: os.remove(self.current_output_file_path + ".exe")
-            except OSError as e: print(f"Error removing output file {self.current_output_file_path}.exe: {e}")
-        self.current_output_file_path = None
-
-    def _connect_network_signals(self):
-        self.network_manager.data_received.connect(self._handle_data_received)
-        self.network_manager.peer_connected.connect(self._handle_peer_connected)
-        self.network_manager.peer_disconnected.connect(self._handle_peer_disconnected)
-        self.network_manager.hosting_started.connect(self._handle_hosting_started)
-        self.network_manager.connection_failed.connect(self._handle_connection_failed)
-
-    @Slot()
-    def _format_code(self):
-        editor = self.current_editor
-        if not editor: 
-            self.status_bar.showMessage("No active editor to format.", 3000)
+        if index_to_close == -1:
             return
-        current_text = editor.toPlainText()
-        if not current_text.strip():
-            self.status_bar.showMessage("Nothing to format.", 3000)
-            return
-        try:
-            cursor = editor.textCursor()
-            original_pos = cursor.position()
-            formatted_text = black.format_str(current_text, mode=black.FileMode())
-            if formatted_text == current_text:
-                self.status_bar.showMessage("Code is already well-formatted.", 3000)
-                return
-            self._is_updating_from_network = True 
-            editor.setPlainText(formatted_text)
-            self._is_updating_from_network = False
-            new_cursor = editor.textCursor()
-            new_cursor.setPosition(min(original_pos, len(formatted_text)))
-            editor.setTextCursor(new_cursor)
-            self.status_bar.showMessage("Code formatted successfully.", 3000)
-        except black.NothingChanged:
-            self.status_bar.showMessage("Code is already well-formatted.", 3000)
-        except black.InvalidInput as e:
-            QMessageBox.warning(self, "Formatting Error", f"Could not format: {e}")
-        except Exception as e:
-            QMessageBox.critical(self, "Formatting Error", f"Error: {e}")
 
-    @Slot()
-    def _start_hosting_session(self):
-        self.network_manager.start_hosting(self.DEFAULT_PORT)
-        self.status_bar.showMessage(f"Attempting to host on port {self.DEFAULT_PORT}...")
-
-    @Slot()
-    def _connect_to_host_session(self):
-        ip, port = ConnectionDialog.get_details(self) 
-        if ip and port:
-            self.network_manager.connect_to_host(ip, port)
-            self.status_bar.showMessage(f"Attempting to connect to {ip}:{port}...")
-        else:
-            self.status_bar.showMessage("Connection cancelled.")
+        widget = self.tab_widget.widget(index_to_close)
+        if widget is not None:
+            # Disconnect signals first
+            if isinstance(widget, CodeEditor):
+                try:
+                    widget.textChanged.disconnect(self.on_text_editor_changed)
+                    widget.control_reclaim_requested.disconnect(self.on_host_reclaim_control)
+                    # Attempt to disconnect other signals if they were connected
+                    widget.cursor_position_changed_signal.disconnect(self._update_cursor_position_label)
+                    widget.language_changed_signal.disconnect(self._update_language_label)
+                except RuntimeError: # Signal already disconnected
+                    pass 
             
-    @Slot()
-    def _stop_current_session(self):
-        self.network_manager.stop_session()
-
-    @Slot(str)
-    def _handle_data_received(self, text: str):
-        editor = self.current_editor
-        if not editor: return
-        self._is_updating_from_network = True
-        cursor = editor.textCursor()
-        old_pos = cursor.position()
-        old_anchor = cursor.anchor()
-        editor.setPlainText(text) # Update the content of the current editor
-        if old_anchor != old_pos:
-            cursor.setPosition(old_anchor, QTextCursor.MoveAnchor)
-            cursor.setPosition(old_pos, QTextCursor.KeepAnchor)
-        else:
-            cursor.setPosition(old_pos)
-        editor.setTextCursor(cursor)
-        self._is_updating_from_network = False
-
-    @Slot(str, int)
-    def _handle_hosting_started(self, host_ip: str, port_num: int):
-        self.status_bar.showMessage(f"Hosting on {host_ip}:{port_num}. Waiting for connection...")
-        self.start_hosting_action.setEnabled(False)
-        self.connect_to_host_action.setEnabled(False)
-        self.stop_session_action.setEnabled(True)
-        # Host can always edit
-        if self.current_editor: self.current_editor.setReadOnly(False) 
-        self._update_window_title() 
-
-    @Slot()
-    def _handle_peer_connected(self):
-        self.status_bar.showMessage("Peer connected. Collaboration active.")
-        self.start_hosting_action.setEnabled(False)
-        self.connect_to_host_action.setEnabled(False)
-        self.stop_session_action.setEnabled(True)
-        # If client, editor becomes read-only
-        if not self.network_manager._is_server and self.current_editor:
-            self.current_editor.setReadOnly(True)
-        self._update_window_title() 
-
-    @Slot()
-    def _handle_peer_disconnected(self):
-        self.status_bar.showMessage("Peer disconnected. Session ended.")
-        self.start_hosting_action.setEnabled(True)
-        self.connect_to_host_action.setEnabled(True)
-        self.stop_session_action.setEnabled(False)
-        # Editor becomes writable again for everyone
-        if self.current_editor: self.current_editor.setReadOnly(False)
-        self._update_window_title()
-
-    @Slot(str)
-    def _handle_connection_failed(self, error_message: str):
-        QMessageBox.critical(self, "Network Error", error_message)
-        self.status_bar.showMessage(f"Error: {error_message}")
-        self.start_hosting_action.setEnabled(True)
-        self.connect_to_host_action.setEnabled(True)
-        self.stop_session_action.setEnabled(False)
-        self._update_window_title()
-
-    @Slot()
-    def _on_editor_text_changed_for_network(self):
-        editor = self.current_editor
-        if not editor or self._is_updating_from_network: # Ensure this flag is respected
-            return
-
-        is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
-        is_connected_client = (not self.network_manager._is_server and
-                               self.network_manager.client_socket and
-                               self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
-
-        # Client only sends data if editor is not read-only (which it would be in a session)
-        # Host can always send.
-        if is_host_with_clients or (is_connected_client and not editor.isReadOnly()):
-            current_text = editor.toPlainText()
-            self.network_manager.send_data(current_text)
-
-    # --- AI Assistant Methods ---
-    @Slot()
-    def show_ai_assistant(self):
-        if not self.ai_assistant_window_instance:
-            # Pass 'self' (MainWindow instance) and the signal emitter
-            self.ai_assistant_window_instance = AIAssistantWindow(
-                main_window=self,
-                apply_code_signal_emitter=self.ai_apply_code_signal_emitter,
-                parent=self # Ensure it's properly parented
-            )
-            # Ensure the window is cleaned up when closed
-            self.ai_assistant_window_instance.finished.connect(self._ai_assistant_closed)
-        self.ai_assistant_window_instance.show()
-        self.ai_assistant_window_instance.activateWindow()
-        self.ai_assistant_window_instance.raise_()
-
-    @Slot()
-    def _ai_assistant_closed(self):
-        self.ai_assistant_window_instance = None # Allow garbage collection and recreation
-
-    @Slot(str)
-    def handle_apply_code_edit(self, new_code: str):
-        editor = self.current_editor
-        if editor:
-            # Store cursor position
-            cursor = editor.textCursor()
-            original_pos = cursor.position()
-
-            # Use a flag to prevent feedback loop if network sync is also active for text changes
-            # This specific flag might need to be more general if text changes can come from other sources too
-            # For now, reusing _is_updating_from_network, but consider a more specific one if needed.
-            self._is_updating_from_network = True
-            editor.setPlainText(new_code)
-            self._is_updating_from_network = False # Reset flag
-
-            # Restore cursor position (or try to)
-            new_cursor = editor.textCursor()
-            # Ensure cursor position is within new text bounds
-            new_cursor.setPosition(min(original_pos, len(new_code)))
-            editor.setTextCursor(new_cursor)
-
-            self.status_bar.showMessage("AI Assistant applied code changes.", 3000)
-            # Optionally, mark the document as modified, which also updates tab asterisk
-            editor.document().setModified(True)
-        else:
-            self.status_bar.showMessage("AI Assistant: No active editor to apply changes to.", 3000)
-            # Optionally show a message box to the user
-            QMessageBox.warning(self, "AI Assistant Error", "No active editor selected to apply code changes.")
-    # --- End AI Assistant Methods ---
-
-    @Slot()
-    def _create_new_file_context_aware(self):
-        target_dir = ""
-        current_tree_index = self.file_tree_view.currentIndex()
-
-        if current_tree_index.isValid():
-            path_from_selection = self.file_system_model.filePath(current_tree_index)
-            if os.path.isdir(path_from_selection):
-                target_dir = path_from_selection
-            elif os.path.isfile(path_from_selection):
-                target_dir = os.path.dirname(path_from_selection)
-            else:
-                target_dir = self.file_system_model.rootPath()
-        else:
-            target_dir = self.file_system_model.rootPath()
-            if not target_dir:
-                target_dir = QDir.currentPath()
-
-        file_name, ok = QInputDialog.getText(self, "New File", "Enter new file name:", QLineEdit.EchoMode.Normal, "")
-
-        if ok and file_name:
-            file_name = file_name.strip() # Ensure no leading/trailing whitespace in filename itself
-            if not file_name:
-                QMessageBox.warning(self, "Invalid Name", "File name cannot be empty.")
-                self.status_bar.showMessage("File creation cancelled: empty name.", 3000)
-                return
-
-            if '/' in file_name or '\\' in file_name: # Check for path separators
-                QMessageBox.warning(self, "Invalid Name", "File name cannot contain path separators (e.g., / or \\).")
-                self.status_bar.showMessage("File creation cancelled: invalid characters in name.", 3000)
-                return
-
-            full_file_path = os.path.join(target_dir, file_name)
-
-            # Check if file already exists
-            if os.path.exists(full_file_path):
-                QMessageBox.warning(self, "File Exists",
-                                    f"A file or folder with the name '{file_name}' already exists in '{target_dir}'.")
-                self.status_bar.showMessage(f"File creation aborted: '{file_name}' already exists.", 3000)
-                return
-
-            # Try to create the file
-            try:
-                with open(full_file_path, 'w', encoding='utf-8') as f:
-                    # File is created empty, nothing to write for now
-                    pass
-                self.status_bar.showMessage(f"Successfully created file: {full_file_path}", 3000)
-
-                # Open the newly created file in a new editor tab
-                self._add_new_editor_tab(file_path=full_file_path)
-
-                # Optional: Select the newly created file in the tree view.
-                # This requires finding the model index for the new file path.
-                # new_file_index = self.file_system_model.index(full_file_path)
-                # if new_file_index.isValid():
-                #    self.file_tree_view.setCurrentIndex(new_file_index)
-                #    self.file_tree_view.scrollTo(new_file_index)
-
-            except OSError as e:
-                QMessageBox.critical(self, "Creation Error",
-                                     f"Could not create file: {full_file_path}\n\nError: {e}")
-                self.status_bar.showMessage(f"Error creating file: {e}", 5000)
-                return
-        else:
-            self.status_bar.showMessage("New file creation cancelled by user.", 3000)
-            return
-
-    def eventFilter(self, watched_object, event: QEvent):
-        if watched_object is self.terminal_panel_te and event.type() == QEvent.Type.KeyPress:
-            if self.process and self.process.state() == QProcess.ProcessState.Running and \
-               self.run_debug_mode_selector and self.run_debug_mode_selector.currentText() == "Debug":
-                key_event = event # event is already a QKeyEvent
-
-                if key_event.key() == Qt.Key_Return or key_event.key() == Qt.Key_Enter:
-                    cursor = self.terminal_panel_te.textCursor()
-
-                    # Move cursor to the beginning of the current line (block)
-                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-                    # Select text to the end of the current line (block)
-                    cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
-                    current_line_text = cursor.selectedText()
-
-                    prompts_to_check = ["(Pdb) ", "Pdb> ", "(Pdb)", "Pdb>", "... ", "...> "]
-                    command_text = current_line_text
-
-                    found_prompt_in_line = False
-                    for pdb_prompt in prompts_to_check:
-                        prompt_idx = current_line_text.rfind(pdb_prompt)
-                        if prompt_idx != -1:
-                            command_text = current_line_text[prompt_idx + len(pdb_prompt):]
-                            found_prompt_in_line = True
-                            break
-
-                    if not found_prompt_in_line:
-                        command_text = current_line_text
-
-                    self.process.write(command_text.encode('utf-8') + b'\n')
-
-                    return False # Let event propagate
-
-                elif key_event.key() == Qt.Key_C and key_event.modifiers() & Qt.ControlModifier:
-                    if sys.platform == "win32":
-                        self.process.generateConsoleCtrlEvent(0) # CTRL_C_EVENT
-                    else:
-                        self.process.terminate()
-                    self.terminal_panel_te.appendPlainText("^C\n")
-                    return True # Event handled
-
-        return super().eventFilter(watched_object, event)
-
-    def _on_editor_text_changed_for_network(self):
-        editor = self.current_editor
-        if not editor or self._is_updating_from_network: # Check the flag here
-            return
+            # Remove from tab_data_map
+            if widget in self.tab_data_map:
+                del self.tab_data_map[widget]
+            
+            widget.deleteLater()
         
-        is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
-        is_connected_client = (not self.network_manager._is_server and 
-                               self.network_manager.client_socket and 
-                               self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
+        self.tab_widget.removeTab(index_to_close)
 
-        # Client only sends data if editor is not read-only (which it would be in a session)
-        # Host can always send.
-        if is_host_with_clients or (is_connected_client and not editor.isReadOnly()):
-            current_text = editor.toPlainText()
-            self.network_manager.send_data(current_text)
+
+    def create_new_file(self):
+        # 1. Context-Aware Path Detection
+        selected_index = self.file_explorer.selectionModel().currentIndex()
+        target_directory = None
+
+        if selected_index.isValid():
+            selected_path = self.file_explorer.model.filePath(selected_index)
+            if os.path.isdir(selected_path):
+                target_directory = selected_path
+            else: # A file is selected
+                target_directory = os.path.dirname(selected_path)
+        else: # Nothing is selected, default to root path
+            target_directory = self.file_explorer.model.rootPath()
+
+        if not target_directory:
+            QMessageBox.critical(self, "Error", "Could not determine target directory for new file.")
+            return
+
+        # 2. User Input for Filename
+        file_name, ok = QInputDialog.getText(self, "New File", "Enter new file name:", QLineEdit.Normal, "")
+
+        if not ok or not file_name:
+            return # User cancelled or entered empty name
+
+        full_path = os.path.join(target_directory, file_name)
+
+        # 3. File Creation and Error Handling
+        if os.path.exists(full_path):
+            QMessageBox.warning(self, "File Exists", "A file or folder with this name already exists.")
+            return
+
+        try:
+            with open(full_path, 'w', encoding='utf-8') as f:
+                pass # Create an empty file
+            
+            # 4. Post-Creation Workflow
+            self.open_new_tab(full_path) # Open the new file in the editor
+            self.status_bar.showMessage(f"Created new file: {full_path}", 3000)
+
+        except OSError as e:
+            QMessageBox.critical(self, "Error Creating File", f"Failed to create file '{file_name}': {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+
+    # This version of close_tab is removed as the one above is more complete
+    # and already incorporates the self.tab_data_map logic.
+
+    def open_file(self):
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
+        if file_dialog.exec():
+            selected_file = file_dialog.selectedFiles()[0]
+            self.open_new_tab(selected_file)
+
+    def save_current_file(self):
+        current_index = self.tab_widget.currentIndex()
+        if current_index == -1:
+            self.status_bar.showMessage("No active editor to save.")
+            return False
+        return self._save_file(current_index)
+
+    def save_current_file_as(self):
+        current_index = self.tab_widget.currentIndex()
+        if current_index == -1:
+            self.status_bar.showMessage("No active editor to save.")
+            return False
+        return self._save_file(current_index, save_as=True)
+
+    def _save_file(self, index: int, save_as: bool = False) -> bool:
+        # 1. Get Current State
+        editor = self.tab_widget.widget(index)
+        if not isinstance(editor, CodeEditor):
+            print("DEBUG: _save_file - editor is not CodeEditor instance")
+            return False
+
+        # Retrieve tab_data using self.tab_data_map.get(editor)
+        tab_data = self.tab_data_map.get(editor)
+        if tab_data is None:
+            # Fallback: Initialize tab_data if it's missing. This is a recovery mechanism.
+            current_path_from_editor = getattr(editor, 'file_path', None)
+            tab_data = {"path": current_path_from_editor, "is_dirty": True} # Assume dirty
+            self.tab_data_map[editor] = tab_data # Add to map
+            # print(f"WARNING: _save_file - tab_data was None for editor, initialized to: {tab_data}")
+
+        current_path = tab_data.get("path")
+        # editor_file_path = getattr(editor, 'file_path', None) # For fallback logic if needed
+
+        # Fallback logic for current_path if tab_data had None, but editor knew its path (and not save_as)
+        if current_path is None and editor.file_path is not None and not save_as:
+             current_path = editor.file_path
+             tab_data["path"] = current_path # Synchronize tab_data into our map's dictionary
+
+        # 2. Handle "Untitled" Files / "Save As"
+        if current_path is None or save_as:
+            suggested_dir = os.path.dirname(current_path) if current_path and os.path.dirname(current_path) else QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+            if save_as or current_path is None: 
+                suggested_filename_base = "Untitled.py"
+            else: 
+                suggested_filename_base = os.path.basename(current_path)
+            
+            full_suggested_path = os.path.join(suggested_dir, suggested_filename_base)
+
+            new_path, _ = QFileDialog.getSaveFileName(
+                self, "Save File As", full_suggested_path,
+                "All Files (*);;Python Files (*.py);;C++ Files (*.cpp *.cxx *.h *.hpp);;Text Files (*.txt)"
+            )
+
+            if not new_path:
+                self.statusBar().showMessage("Save operation cancelled.", 3000)
+                return False
+            
+            current_path = new_path
+            tab_data["path"] = current_path # This updates the dictionary in self.tab_data_map
+            editor.file_path = current_path # Keep editor's own file_path in sync
+            # No self.tab_widget.setTabData needed as self.tab_data_map[editor] = tab_data is done if it was None,
+            # or tab_data is a reference to the dict in the map.
+            editor._update_language_and_highlighting()
+            if hasattr(self, 'file_explorer') and self.file_explorer:
+                self.file_explorer.refresh_tree()
+
+        if not current_path:
+             QMessageBox.critical(self, "Save Error", "No file path determined for saving.")
+             self.statusBar().showMessage("Save error: No file path.", 5000)
+             return False
+
+        # 3. Provide Clear User Feedback (Start of Operation)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage(f"Formatting and saving '{os.path.basename(current_path)}'...")
+
+        # 4. Perform Synchronous Formatting (for Python files)
+        original_text = editor.toPlainText()
+        formatted_text = original_text
+
+        if current_path.lower().endswith(".py"):
+            try:
+                formatted_text = black.format_str(original_text, mode=black.FileMode())
+            except black.parsing.LibCSTError as e:
+                QMessageBox.critical(self, "Formatting Error", f"Syntax error in Python code. Cannot format and save:\n{e}")
+                QApplication.restoreOverrideCursor()
+                self.statusBar().showMessage("Formatting error. File not saved.", 5000)
+                return False
+            except Exception as e:
+                QMessageBox.critical(self, "Formatting Error", f"Failed to format Python code with Black. File not saved:\n{e}")
+                QApplication.restoreOverrideCursor()
+                self.statusBar().showMessage("Formatting error. File not saved.", 5000)
+                return False
+        
+        # 5. Perform Synchronous Write to Disk
+        try:
+            dir_name = os.path.dirname(current_path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+            with open(current_path, 'w', encoding='utf-8') as f:
+                f.write(formatted_text)
+        except (IOError, PermissionError) as e:
+            QMessageBox.critical(self, "File Save Error", f"Could not write to disk: '{current_path}'.\nError: {e}")
+            QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage("File write error. File not saved.", 5000)
+            return False
+        except Exception as e:
+            QMessageBox.critical(self, "File Save Error", f"An unexpected error occurred while writing to '{current_path}'.\nError: {e}")
+            QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage("Unexpected write error. File not saved.", 5000)
+            return False
+
+        # 6. Finalize State on Success
+        self.is_updating_from_network = True
+        current_cursor_pos = editor.textCursor().position()
+        editor.setPlainText(formatted_text)
+        new_cursor = editor.textCursor()
+        new_cursor.setPosition(min(current_cursor_pos, len(formatted_text)))
+        editor.setTextCursor(new_cursor)
+        self.is_updating_from_network = False
+        
+        tab_data["is_dirty"] = False # This updates the dictionary in self.tab_data_map
+        # tab_data["path"] = current_path # Path is already updated in tab_data
+        # self.tab_data_map[editor] = tab_data # This ensures the map has the latest state.
+                                            # If tab_data is a reference to the dict in the map,
+                                            # this explicit assignment might be redundant but safe.
+        
+        new_tab_title = os.path.basename(current_path)
+        self.tab_widget.setTabText(index, new_tab_title)
+        self.tab_widget.setTabToolTip(index, current_path) # Set full path as tooltip
+        
+        QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(f"File '{new_tab_title}' saved successfully.", 3000)
+        
+        return True
+
+    def format_current_code(self):
+        current_editor = self._get_current_code_editor()
+        if not current_editor:
+            self.status_bar.showMessage("No active editor to format.")
+            return
+
+        current_index = self.tab_widget.indexOf(current_editor)
+        if current_index == -1:
+            return
+
+        code_text = current_editor.toPlainText()
+        # Get tab_data from the map
+        tab_data = self.tab_data_map.get(current_editor)
+        file_path = tab_data.get("path") if tab_data else None
+
+        # Only attempt to format if it's a Python file
+        if file_path and file_path.lower().endswith(".py"):
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self.statusBar().showMessage("Formatting code...")
+            try:
+                formatted_text = black.format_str(code_text, mode=black.FileMode())
+                current_editor.setPlainText(formatted_text) # This will trigger on_text_editor_changed
+                self.status_bar.showMessage("Code formatted.")
+                
+                # Mark as dirty in self.tab_data_map if formatting changed the text
+                # on_text_editor_changed will handle the asterisk if it's a new change
+                if tab_data: # Ensure tab_data was found
+                    if original_text != formatted_text and not tab_data.get("is_dirty", False):
+                        tab_data["is_dirty"] = True
+                        # Update tab title with asterisk if not already there
+                        # This part is tricky as on_text_editor_changed also does this.
+                        # To avoid double-asterisk or complex logic, let on_text_editor_changed handle it.
+                        # We just ensure the dirty flag is set in our map.
+                        # current_tab_text = self.tab_widget.tabText(current_index)
+                        # if not current_tab_text.endswith("*"):
+                        #    self.tab_widget.setTabText(current_index, current_tab_text + "*")
+                
+            except black.parsing.LibCSTError as e:
+                self.status_bar.showMessage("Formatting failed: Syntax error.")
+                QMessageBox.critical(self, "Formatting Error", f"Syntax error in code. Cannot format:\n{e}")
+            except Exception as e:
+                self.status_bar.showMessage("Formatting failed.")
+                QMessageBox.critical(self, "Formatting Error", f"Failed to format code with Black:\n{e}")
+            finally:
+                QApplication.restoreOverrideCursor()
+        else:
+            self.status_bar.showMessage("Formatting is only supported for Python files (.py).")
+
+
+    def save_session(self):
+        session_data = {}
+        try:
+            root_path = self.file_explorer.model().rootPath()
+            open_files = []
+            for i in range(self.tab_widget.count()):
+                editor = self.tab_widget.widget(i)
+                if isinstance(editor, CodeEditor):
+                    tab_data = self.tab_data_map.get(editor) # Get tab data from map
+                    if tab_data and tab_data.get("path") and os.path.exists(tab_data.get("path")):
+                        open_files.append(tab_data.get("path"))
+            
+            active_file_index = self.tab_widget.currentIndex()
+            
+            session_data = {
+                "root_path": root_path,
+                "open_files": open_files,
+                "active_file_index": active_file_index
+            }
+            
+            config_dir = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
+            session_dir = os.path.join(config_dir, ".aether_editor")
+            os.makedirs(session_dir, exist_ok=True)
+            session_file = os.path.join(session_dir, "session.json")
+            
+            with open(session_file, 'w') as f:
+                json.dump(session_data, f, indent=4)
+            print(f"LOG: Session saved to {session_file}")
+        except Exception as e:
+            print(f"LOG: save_session - Error saving session: {e}")
+
+    def load_session(self):
+        config_dir = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
+        session_dir = os.path.join(config_dir, ".aether_editor")
+        session_file = os.path.join(session_dir, "session.json")
+        
+        if os.path.exists(session_file):
+            try:
+                with open(session_file, 'r') as f:
+                    session_data = json.load(f)
+                
+                root_path = session_data.get("root_path")
+                open_files = session_data.get("open_files", [])
+                active_file_index = session_data.get("active_file_index", 0)
+                
+                # Restore Folder
+                if root_path and os.path.isdir(root_path):
+                    self.file_explorer.set_root_path(root_path)
+                
+                # Close the initial empty tab if it's the only one
+                # Check if the initial tab is "Untitled" and not dirty
+                if self.tab_widget.count() == 1:
+                    editor = self.tab_widget.widget(0)
+                    if isinstance(editor, CodeEditor):
+                        tab_data = self.tab_data_map.get(editor) # Get tab data from map
+                        if tab_data and tab_data.get("path") is None and not tab_data.get("is_dirty", False):
+                            self.close_tab(0) # close_tab will also remove from tab_data_map
+                
+                # Restore Files
+                for file_path in open_files:
+                    if os.path.exists(file_path):
+                        self.open_new_tab(file_path)
+                
+                # Restore Active Tab
+                if 0 <= active_file_index < self.tab_widget.count():
+                    self.tab_widget.setCurrentIndex(active_file_index)
+                elif self.tab_widget.count() > 0:
+                    self.tab_widget.setCurrentIndex(0) # Fallback to first tab
+                
+                print(f"LOG: Session loaded from {session_file}")
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"LOG: load_session - Error loading session file: {e}")
+                # Fallback to default state if file is corrupted or unreadable
+                if self.tab_widget.count() == 0:
+                    self.open_new_tab() # Ensure at least one tab is open
+        else:
+            print("LOG: load_session - No session file found, starting with default state.")
+            if self.tab_widget.count() == 0:
+                self.open_new_tab() # Ensure at least one tab is open
 
     def closeEvent(self, event):
-        if self.process and self.process.state() == QProcess.Running:
-            self.process.kill()
-            self.process.waitForFinished(1000)
-        self._cleanup_temp_files()
-        self.network_manager.stop_session()
+        unsaved_changes_exist = False
+        for i in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(i)
+            if isinstance(editor, CodeEditor):
+                tab_data = self.tab_data_map.get(editor)
+                if tab_data and tab_data.get("is_dirty", False):
+                    unsaved_changes_exist = True
+                    break
+
+        if unsaved_changes_exist:
+            reply = QMessageBox.question(self, "Unsaved Changes",
+                                         "You have unsaved changes. Do you want to save them before closing?",
+                                         QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                         QMessageBox.Save) # Default button
+
+            if reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            elif reply == QMessageBox.Save:
+                # Store current index to restore it later
+                original_current_index = self.tab_widget.currentIndex()
+                
+                for i in range(self.tab_widget.count()):
+                    editor = self.tab_widget.widget(i) # Get editor for the tab
+                    if isinstance(editor, CodeEditor):
+                        tab_data = self.tab_data_map.get(editor) # Get its data from the map
+                        if tab_data and tab_data.get("is_dirty", False):
+                            # Temporarily set the current index to the tab to be saved
+                            # This ensures _save_file operates on the correct tab
+                            self.tab_widget.setCurrentIndex(i)
+                        if not self._save_file(i): # If save is cancelled
+                            event.ignore()
+                            return # Stop processing and prevent close
+                
+                # Restore original current index if it's still valid
+                if 0 <= original_current_index < self.tab_widget.count():
+                    self.tab_widget.setCurrentIndex(original_current_index)
         
-        # Check for unsaved changes in any tab
-        for i in range(self.editor_tabs.count()):
-            editor = self.editor_tabs.widget(i)
-            if editor and editor.document().isModified():
-                self.editor_tabs.setCurrentIndex(i) # Focus the tab with unsaved changes
-                reply = QMessageBox.question(self, "Unsaved Changes",
-                                             f"'{self.editor_tabs.tabText(i).replace('*','')}*' has unsaved changes. Save before exiting?",
-                                             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                                             QMessageBox.Cancel)
-                if reply == QMessageBox.Cancel:
-                    event.ignore()
-                    return
-                if reply == QMessageBox.Save:
-                    if not self._save_current_file(): # If save is cancelled
-                        event.ignore()
-                        return
-        super().closeEvent(event)
+        # Only save the session and accept the close event if all saves were successful or discarded
+        self.save_session()
+        event.accept()
 
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    @Slot(QPoint)
+    def on_file_tree_context_menu(self, position):
+        index = self.file_explorer.indexAt(position)
+        if not index.isValid():
+            return # No item clicked
 
-[end of main_window.py]
+        file_path = self.file_explorer.model.filePath(index)
+        
+        menu = QMenu(self)
+        
+        rename_action = QAction("Rename", self)
+        rename_action.triggered.connect(lambda: self._rename_file_folder(index))
+        menu.addAction(rename_action)
+
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(lambda: self._delete_file_folder(index))
+        menu.addAction(delete_action)
+
+        menu.exec(self.file_explorer.mapToGlobal(position))
+
+    def _find_editor_for_path(self, file_path):
+        """Helper to find an open CodeEditor tab for a given file path."""
+        for i in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(i)
+            if isinstance(editor, CodeEditor) and editor.file_path == file_path:
+                return editor, i
+        return None, -1
+
+    def _rename_file_folder(self, index):
+        model = self.file_explorer.model
+        # file_index = model.index(index.row(), 0, index.parent()) # This seems to be Qt specific for tree models
+        # old_path = model.filePath(file_index)
+        old_path = model.filePath(index) # Simpler, index should be the direct item index
+        
+        if not old_path:
+            self.status_bar.showMessage("Could not get path for selected item.")
+            return
+
+        is_dir = os.path.isdir(old_path)
+        item_type = "folder" if is_dir else "file"
+        
+        new_name, ok = QInputDialog.getText(self, f"Rename {item_type}", f"Enter new name for {os.path.basename(old_path)}:",
+                                            QLineEdit.Normal, os.path.basename(old_path))
+        if ok and new_name:
+            new_path = os.path.join(os.path.dirname(old_path), new_name)
+            
+            # If it's an open editor, update its tab data and tab title
+            editor, tab_idx = self._find_editor_for_path(old_path) # Renamed tab_index to tab_idx
+            if editor:
+                tab_data_for_editor = self.tab_data_map.get(editor) # Get from map
+                if tab_data_for_editor: # Check if found in map
+                    tab_data_for_editor["path"] = new_path
+                    # tab_data_for_editor["is_dirty"] could be set if needed, e.g. if rename dirties.
+                # Update editor's internal file_path as well
+                editor.file_path = new_path
+                self.tab_widget.setTabText(tab_idx, os.path.basename(new_path))
+                self.tab_widget.setTabToolTip(tab_idx, new_path) # Update tooltip as well
+            
+            try:
+                os.rename(old_path, new_path)
+                self.status_bar.showMessage(f"Renamed {item_type} to {new_name}")
+                self.file_explorer.refresh_view() # Refresh the file explorer
+            except Exception as e:
+                self.status_bar.showMessage(f"Error renaming {item_type}: {e}")
+
+    def _delete_file_folder(self, index):
+        path_to_delete = self.file_explorer.model.filePath(index)
+        name_to_delete = os.path.basename(path_to_delete)
+
+        reply = QMessageBox.question(self, "Delete", f"Are you sure you want to delete '{name_to_delete}'?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            try:
+                # Close any open tabs related to the deleted file/folder
+                tabs_to_close = []
+                for i in range(self.tab_widget.count()):
+                    editor = self.tab_widget.widget(i)
+                    if isinstance(editor, CodeEditor) and editor.file_path:
+                        if os.path.isfile(path_to_delete) and editor.file_path == path_to_delete:
+                            tabs_to_close.append(i)
+                        elif os.path.isdir(path_to_delete) and editor.file_path.startswith(path_to_delete):
+                            tabs_to_close.append(i)
+                
+                # Close tabs in reverse order to avoid index issues
+                for i in sorted(tabs_to_close, reverse=True):
+                    self.close_tab(i)
+
+                if os.path.isdir(path_to_delete):
+                    shutil.rmtree(path_to_delete)
+                else:
+                    os.remove(path_to_delete)
+                self.status_bar.showMessage(f"Deleted '{name_to_delete}'")
+            except (OSError, PermissionError) as e:
+                QMessageBox.critical(self, "Delete Error", f"Permission denied or file in use: {e}")
+            except Exception as e:
+                QMessageBox.critical(self, "Delete Error", f"An unexpected error occurred while deleting '{name_to_delete}': {e}")
+
+    @Slot()
+    def open_ai_assistant(self):
+        """
+        Opens the AI Assistant window.
+        """
+        self.ai_assistant_window = AIAssistantWindow(self) # Pass self (MainWindow instance)
+        self.ai_assistant_window.show()
+
+    @Slot(str)
+    def apply_ai_code_edit(self, new_code):
+        """
+        Slot to receive code edits from the AI assistant and apply them to the current editor.
+        """
+        current_editor = self._get_current_code_editor()
+        if current_editor:
+            # Set the flag to prevent network echo
+            current_editor._is_programmatic_change = True
+            current_editor.setPlainText(new_code)
+            current_editor._is_programmatic_change = False
+            self.status_bar.showMessage("AI Assistant applied code changes.")
+        else:
+            self.status_bar.showMessage("AI Assistant tried to edit, but no active editor found.")
+
+
