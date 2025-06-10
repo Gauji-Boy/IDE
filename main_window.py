@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QMessageBox, QApplication, QStatusBar,
     QToolBar, QComboBox, QDockWidget, QTabWidget, QPlainTextEdit, 
     QSizePolicy, QVBoxLayout, QPushButton, QHBoxLayout, QWidget,
-    QTreeView, QFileSystemModel, QFileDialog, QToolButton, QMenu, QStyle
+    QTreeView, QFileSystemModel, QFileDialog, QToolButton, QMenu, QStyle,
+    QInputDialog, QLineEdit
 )
 from PySide6.QtGui import QAction, QKeySequence, QTextCursor, QIcon, QFont, QActionGroup
 from PySide6.QtCore import (
@@ -89,8 +90,8 @@ class MainWindow(QMainWindow):
 
         if self.terminal_panel_te: # Ensure it exists
             self.terminal_panel_te.installEventFilter(self)
-        else:
-            print("ERROR: self.terminal_panel_te not initialized before installing event filter.")
+        # else: # Removed the print for brevity as it's an internal check
+            # print("ERROR: self.terminal_panel_te not initialized before installing event filter.")
 
     @property
     def current_editor(self) -> CodeEditor | None:
@@ -511,7 +512,7 @@ class MainWindow(QMainWindow):
         file_menu = self.menu_bar.addMenu("&File")
         new_file_action = QAction(QIcon.fromTheme("document-new", QIcon()), "&New File", self)
         new_file_action.setShortcut(QKeySequence.New)
-        new_file_action.triggered.connect(lambda: self._add_new_editor_tab())
+        new_file_action.triggered.connect(self._create_new_file_context_aware) # Changed connection
         file_menu.addAction(new_file_action)
         open_file_action = QAction(QIcon.fromTheme("document-open", QIcon()), "&Open File...", self)
         open_file_action.setShortcut(QKeySequence.Open)
@@ -904,6 +905,74 @@ class MainWindow(QMainWindow):
             # Optionally show a message box to the user
             QMessageBox.warning(self, "AI Assistant Error", "No active editor selected to apply code changes.")
     # --- End AI Assistant Methods ---
+
+    @Slot()
+    @Slot()
+    def _create_new_file_context_aware(self):
+        target_dir = ""
+        current_tree_index = self.file_tree_view.currentIndex()
+
+        if current_tree_index.isValid():
+            path_from_selection = self.file_system_model.filePath(current_tree_index)
+            if os.path.isdir(path_from_selection):
+                target_dir = path_from_selection
+            elif os.path.isfile(path_from_selection):
+                target_dir = os.path.dirname(path_from_selection)
+            else: 
+                target_dir = self.file_system_model.rootPath()
+        else:
+            target_dir = self.file_system_model.rootPath()
+            if not target_dir: 
+                target_dir = QDir.currentPath()
+        
+        file_name, ok = QInputDialog.getText(self, "New File", "Enter new file name:", QLineEdit.EchoMode.Normal, "")
+        
+        if ok and file_name:
+            file_name = file_name.strip() # Ensure no leading/trailing whitespace in filename itself
+            if not file_name:
+                QMessageBox.warning(self, "Invalid Name", "File name cannot be empty.")
+                self.status_bar.showMessage("File creation cancelled: empty name.", 3000)
+                return
+
+            if '/' in file_name or '\\' in file_name: # Check for path separators
+                QMessageBox.warning(self, "Invalid Name", "File name cannot contain path separators (e.g., / or \\).")
+                self.status_bar.showMessage("File creation cancelled: invalid characters in name.", 3000)
+                return
+
+            full_file_path = os.path.join(target_dir, file_name)
+
+            # Check if file already exists
+            if os.path.exists(full_file_path):
+                QMessageBox.warning(self, "File Exists", 
+                                    f"A file or folder with the name '{file_name}' already exists in '{target_dir}'.")
+                self.status_bar.showMessage(f"File creation aborted: '{file_name}' already exists.", 3000)
+                return
+
+            # Try to create the file
+            try:
+                with open(full_file_path, 'w', encoding='utf-8') as f:
+                    # File is created empty, nothing to write for now
+                    pass 
+                self.status_bar.showMessage(f"Successfully created file: {full_file_path}", 3000)
+                
+                # Open the newly created file in a new editor tab
+                self._add_new_editor_tab(file_path=full_file_path)
+                
+                # Optional: Select the newly created file in the tree view.
+                # This requires finding the model index for the new file path.
+                # new_file_index = self.file_system_model.index(full_file_path)
+                # if new_file_index.isValid():
+                #    self.file_tree_view.setCurrentIndex(new_file_index)
+                #    self.file_tree_view.scrollTo(new_file_index)
+
+            except OSError as e:
+                QMessageBox.critical(self, "Creation Error", 
+                                     f"Could not create file: {full_file_path}\n\nError: {e}")
+                self.status_bar.showMessage(f"Error creating file: {e}", 5000)
+                return
+        else:
+            self.status_bar.showMessage("New file creation cancelled by user.", 3000)
+            return
 
     def eventFilter(self, watched_object, event: QEvent):
         if watched_object is self.terminal_panel_te and event.type() == QEvent.Type.KeyPress:

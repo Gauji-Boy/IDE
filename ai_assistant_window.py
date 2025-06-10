@@ -26,14 +26,14 @@ class AIAssistantWindow(QDialog):
         self.user_input_edit = QTextEdit(self)
         self.user_input_edit.setFixedHeight(70) # Adjust height as needed
         # Handle Enter key to send, Shift+Enter for newline
-        self.user_input_edit.installEventFilter(self)
+        self.user_input_edit.installEventFilter(self) 
         input_layout.addWidget(self.user_input_edit)
 
         self.send_button = QPushButton("Send", self)
         self.send_button.setFixedHeight(70) # Match input height
         self.send_button.clicked.connect(self.handle_send_message)
         input_layout.addWidget(self.send_button)
-
+        
         layout.addLayout(input_layout)
         self.setLayout(layout)
 
@@ -75,7 +75,7 @@ class AIAssistantWindow(QDialog):
 
         self.append_to_conversation("You", user_message)
         self.user_input_edit.clear()
-
+        
         # Disable input while AI is processing
         self.user_input_edit.setEnabled(False)
         self.send_button.setEnabled(False)
@@ -102,9 +102,3 @@ class AIAssistantWindow(QDialog):
     def closeEvent(self, event):
         # Clean up resources or save conversation if needed
         super().closeEvent(event)
-
-
-    def closeEvent(self, event):
-        # Clean up resources or save conversation if needed
-        super().closeEvent(event)
-
