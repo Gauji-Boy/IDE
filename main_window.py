@@ -52,6 +52,48 @@ class MainWindow(QMainWindow):
         
         self.run_destination = "Output Panel" 
         self.runner_config = RUNNER_CONFIG
+
+        # Adapt Python configuration to the new nested run/debug structure
+        # This simulates the change in config.py for development within main_window.py
+        if "Python" in self.runner_config:
+            python_config = self.runner_config["Python"]
+            py_executable = sys.executable if sys.executable else "python"
+
+            if isinstance(python_config, list): # Old format: ["python", "{file}"]
+                # self.status_bar.showMessage("Adapting Python runner config to new structure.", 2000) # Status bar not ready yet
+                print("Adapting Python runner config to new structure.")
+                self.runner_config["Python"] = {
+                    "run": [py_executable, "-u", "{file}"], # Using -u for unbuffered output
+                    "debug": [py_executable, "-m", "pdb", "{file}"]
+                }
+            elif isinstance(python_config, dict): # Possibly new format already, or partially new
+                if "run" not in python_config:
+                    python_config["run"] = [py_executable, "-u", "{file}"]
+                if "debug" not in python_config:
+                    python_config["debug"] = [py_executable, "-m", "pdb", "{file}"]
+                # Ensure sys.executable is used in existing run/debug commands if they exist
+                if "run" in python_config and isinstance(python_config["run"], list) and python_config["run"]:
+                    if "python" in python_config["run"][0].lower(): # if command is 'python' or 'python3' etc.
+                        python_config["run"][0] = py_executable
+                if "debug" in python_config and isinstance(python_config["debug"], list) and python_config["debug"]:
+                     if "python" in python_config["debug"][0].lower():
+                        python_config["debug"][0] = py_executable
+            else: # Unknown format for Python
+                # self.status_bar.showMessage("Warning: Python runner config has unexpected format. Defaulting.", 3000)
+                print("Warning: Python runner config has unexpected format. Defaulting.")
+                self.runner_config["Python"] = {
+                    "run": [py_executable, "-u", "{file}"],
+                    "debug": [py_executable, "-m", "pdb", "{file}"]
+                }
+        else: # Python not in config at all
+            # self.status_bar.showMessage("Warning: Python not found in runner_config. Adding default.", 3000)
+            print("Warning: Python not found in runner_config. Adding default.")
+            py_executable = sys.executable if sys.executable else "python"
+            self.runner_config["Python"] = {
+                "run": [py_executable, "-u", "{file}"],
+                "debug": [py_executable, "-m", "pdb", "{file}"]
+            }
+
         self.process = None
         self.current_temp_file_path = None
         self.current_output_file_path = None
@@ -62,18 +104,22 @@ class MainWindow(QMainWindow):
         # AI Assistant related initializations
         self.ai_apply_code_signal_emitter = ApplyCodeEditSignal()
         self.ai_apply_code_signal_emitter.apply_edit_signal.connect(self.handle_apply_code_edit)
-        self.ai_assistant_window_instance = None # To keep track of the window
+        self.ai_assistant_window_instance = None
 
-        # Initialize for new run/debug toolbar widget
-        self.current_run_mode = "Run" 
-        self.action_button = None
-        self.dropdown_button = None
-        self.run_debug_menu = None
-        self.run_action_menu_item = None
-        self.debug_action_menu_item = None
-        self.run_debug_action_group = None
-        self.run_action = None # This will be redefined or managed by the new setup
-        self.execute_action = None
+        # Attributes for the old run/debug UI (QToolButton with QMenu)
+        # self.current_run_mode = "Run" # Obsolete with ComboBox
+        # self.action_button = None # Obsolete QToolButton
+        # self.dropdown_button = None # Obsolete QToolButton
+        # self.run_debug_menu = None # Obsolete QMenu
+        # self.run_action_menu_item = None # Obsolete QAction
+        # self.debug_action_menu_item = None # Obsolete QAction
+        # self.run_debug_action_group = None # Obsolete QActionGroup
+
+        # New attributes for ComboBox Run/Debug UI
+        self.run_debug_mode_selector = None
+        self.play_action = None
+
+        self.execute_action = None # For F5 shortcut in menu
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -85,13 +131,11 @@ class MainWindow(QMainWindow):
         self._setup_menus()      
         self._connect_network_signals()
         
-        self._add_new_editor_tab() # Start with one empty tab after all UI setup
-        self._update_run_action_button_ui() # Initialize the run/debug button UI
+        self._add_new_editor_tab()
+        # self._update_run_action_button_ui() # Obsolete call
 
-        if self.terminal_panel_te: # Ensure it exists
+        if self.terminal_panel_te:
             self.terminal_panel_te.installEventFilter(self)
-        # else: # Removed the print for brevity as it's an internal check
-            # print("ERROR: self.terminal_panel_te not initialized before installing event filter.")
 
     @property
     def current_editor(self) -> CodeEditor | None:
@@ -120,7 +164,6 @@ class MainWindow(QMainWindow):
         editor = CodeEditor()
         highlighter = PythonHighlighter(editor.document())
         
-        # Connect signals for this new editor instance
         editor.textChanged.connect(self._on_editor_text_changed_for_network)
         editor.document().modificationChanged.connect(self._update_window_title_and_tab_text)
 
@@ -145,29 +188,28 @@ class MainWindow(QMainWindow):
             MainWindow.untitled_tab_counter += 1
             tab_title = f"Untitled-{MainWindow.untitled_tab_counter}"
             editor.setProperty("file_path", None)
-            editor.document().setModified(False) # New untitled files are initially not modified
+            editor.document().setModified(False)
 
         index = self.editor_tabs.addTab(editor, tab_title)
         self.editor_tabs.setCurrentIndex(index)
         editor.setFocus()
-        self._update_window_title() # Update based on new tab
+        self._update_window_title()
 
     def _close_editor_tab(self, index):
         editor_widget = self.editor_tabs.widget(index)
         if editor_widget:
             if editor_widget.document().isModified():
-                self.editor_tabs.setCurrentIndex(index) # Ensure this is the active tab for context
+                self.editor_tabs.setCurrentIndex(index)
                 reply = QMessageBox.question(self, "Unsaved Changes",
                                              f"'{self.editor_tabs.tabText(index).replace('*','')}*' has unsaved changes. Save before closing?",
                                              QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                                             QMessageBox.Cancel) # Default to Cancel
+                                             QMessageBox.Cancel)
                 if reply == QMessageBox.Cancel:
                     return
                 if reply == QMessageBox.Save:
-                    if not self._save_current_file(): # If save is cancelled
+                    if not self._save_current_file():
                         return 
             
-            # Disconnect signals before deleting
             try: editor_widget.textChanged.disconnect(self._on_editor_text_changed_for_network)
             except RuntimeError: pass
             try: editor_widget.document().modificationChanged.disconnect(self._update_window_title_and_tab_text)
@@ -177,7 +219,7 @@ class MainWindow(QMainWindow):
             editor_widget.deleteLater()
         
         if self.editor_tabs.count() == 0:
-            self._add_new_editor_tab() # Ensure one tab is always open
+            self._add_new_editor_tab()
         else:
             self._update_window_title()
 
@@ -212,22 +254,21 @@ class MainWindow(QMainWindow):
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(editor.toPlainText())
                 self.status_bar.showMessage(f"File saved: {file_path}", 3000)
-                editor.document().setModified(False) # Mark as saved
-                self._update_window_title_and_tab_text(False) # Update titles
+                editor.document().setModified(False)
+                self._update_window_title_and_tab_text(False)
                 return True
             except Exception as e:
                 QMessageBox.critical(self, "Save Error", f"Could not save file: {file_path}\n{e}")
                 self.status_bar.showMessage(f"Error saving file: {e}", 5000)
                 return False
         else:
-            return self._save_current_file_as() # Delegate to Save As if no path
+            return self._save_current_file_as()
 
     def _save_current_file_as(self):
         editor = self.current_editor
         if not editor: return False
         
         current_path = editor.property("file_path") or QDir.currentPath()
-        # Suggest filename for untitled tabs
         suggested_name = self.editor_tabs.tabText(self.editor_tabs.currentIndex()).replace("*","") if not editor.property("file_path") else current_path
 
         file_path, _ = QFileDialog.getSaveFileName(self, "Save File As...", suggested_name, "All Files (*);;Text Files (*.txt);;Python Files (*.py)")
@@ -236,34 +277,31 @@ class MainWindow(QMainWindow):
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(editor.toPlainText())
                 editor.setProperty("file_path", file_path)
-                # Update tab title using the actual editor instance for the current index
                 current_idx = self.editor_tabs.currentIndex()
                 self.editor_tabs.setTabText(current_idx, QFileInfo(file_path).fileName())
-                editor.document().setModified(False) # Mark as saved
-                self._update_window_title_and_tab_text(False) # Update titles
+                editor.document().setModified(False)
+                self._update_window_title_and_tab_text(False)
                 self.status_bar.showMessage(f"File saved as: {file_path}", 3000)
                 return True
             except Exception as e:
                 QMessageBox.critical(self, "Save As Error", f"Could not save file: {file_path}\n{e}")
                 self.status_bar.showMessage(f"Error saving file as: {e}", 5000)
                 return False
-        return False # User cancelled dialog
+        return False
 
 
     def _on_current_tab_changed(self, index):
-        # Disconnect from all tabs first to avoid multiple connections
         for i in range(self.editor_tabs.count()):
             editor = self.editor_tabs.widget(i)
             if editor:
                 try: editor.textChanged.disconnect(self._on_editor_text_changed_for_network)
                 except RuntimeError: pass
-                # Document might be None if tab is being removed
                 doc = editor.document()
                 if doc:
                     try: doc.modificationChanged.disconnect(self._update_window_title_and_tab_text)
                     except RuntimeError: pass
         
-        if index != -1 : # A tab is selected
+        if index != -1 :
             current_editor = self.current_editor
             if current_editor:
                 current_editor.textChanged.connect(self._on_editor_text_changed_for_network)
@@ -278,42 +316,34 @@ class MainWindow(QMainWindow):
         if editor:
             tab_index = self.editor_tabs.currentIndex()
             file_path = editor.property("file_path")
-            tab_text = QFileInfo(file_path).fileName() if file_path else self.editor_tabs.tabText(tab_index).replace("*","") # Base name
+            tab_text = QFileInfo(file_path).fileName() if file_path else self.editor_tabs.tabText(tab_index).replace("*","")
             
             if editor.document().isModified():
                 tab_text += "*"
             
             self.setWindowTitle(f"{tab_text} - {base_title}")
-            # Also update the tab text itself if it's the current tab
-            # This is now handled by _update_window_title_and_tab_text
         elif self.editor_tabs.count() == 0:
              self.setWindowTitle(base_title)
     
     def _update_window_title_and_tab_text(self, modified):
-        # Find which editor's document emitted the signal
-        editor_doc = self.sender() # This should be the QTextDocument
+        editor_doc = self.sender()
         if not editor_doc: return
 
         for i in range(self.editor_tabs.count()):
             editor = self.editor_tabs.widget(i)
             if editor and editor.document() == editor_doc:
                 file_path = editor.property("file_path")
-                base_name = QFileInfo(file_path).fileName() if file_path else self.editor_tabs.tabText(i).replace("*", "") # Fallback to current tab text if no path
+                base_name = QFileInfo(file_path).fileName() if file_path else self.editor_tabs.tabText(i).replace("*", "")
                 
-                # Special handling for untitled tabs to keep their "Untitled-N" name consistent
                 if not file_path:
-                    # Ensure base_name does not become empty or just "*"
                     if not base_name or base_name == "*": 
-                         # Reconstruct "Untitled-N" if needed, requires knowing its number
-                         # This part might need a more robust way to get the original "Untitled-N"
-                         # For now, assume tabText without "*" is the base for untitled
                          current_tab_text_no_star = self.editor_tabs.tabText(i).replace("*","")
                          base_name = current_tab_text_no_star
 
                 new_tab_text = base_name + ("*" if modified else "")
                 self.editor_tabs.setTabText(i, new_tab_text)
                 
-                if i == self.editor_tabs.currentIndex(): # If it's the current tab, update window title
+                if i == self.editor_tabs.currentIndex():
                     self._update_window_title()
                 break
 
@@ -325,167 +355,202 @@ class MainWindow(QMainWindow):
         self.language_selector.addItems(self.runner_config.keys())
         toolbar.addWidget(self.language_selector)
 
-        # New Run/Debug combined button
-        self.run_debug_widget = QWidget()
-        run_debug_layout = QHBoxLayout(self.run_debug_widget)
-        run_debug_layout.setContentsMargins(0, 0, 0, 0) # Compact layout
-        run_debug_layout.setSpacing(0) # No space between buttons
+        # Mode Selector ComboBox
+        self.run_debug_mode_selector = QComboBox()
+        self.run_debug_mode_selector.addItems(["Run", "Debug"])
+        self.run_debug_mode_selector.setFixedWidth(100)
+        self.run_debug_mode_selector.setToolTip("Select execution mode (Run or Debug)")
+        toolbar.addWidget(self.run_debug_mode_selector)
 
-        self.action_button = QToolButton()
-        self.action_button.setAutoRaise(True)
-        self.action_button.clicked.connect(self._on_main_action_button_clicked)
-        # Icon and tooltip will be set by _update_run_action_button_ui later
-
-        self.dropdown_button = QToolButton()
-        self.dropdown_button.setAutoRaise(True)
-        self.dropdown_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
-        self.dropdown_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup) # Show menu immediately
-
-        self.run_debug_menu = QMenu(self)
-        self.run_action_menu_item = QAction("Run", self, checkable=True)
-        self.run_action_menu_item.setChecked(True) # Default to Run
-        self.debug_action_menu_item = QAction("Debug", self, checkable=True)
-
-        self.run_debug_action_group = QActionGroup(self)
-        self.run_debug_action_group.setExclusive(True)
-        self.run_debug_action_group.addAction(self.run_action_menu_item)
-        self.run_debug_action_group.addAction(self.debug_action_menu_item)
-
-        # Connect signals for menu items
-        self.run_action_menu_item.triggered.connect(self._set_run_mode_run)
-        self.debug_action_menu_item.triggered.connect(self._set_run_mode_debug)
-
-        self.run_debug_menu.addAction(self.run_action_menu_item)
-        self.run_debug_menu.addAction(self.debug_action_menu_item)
-        self.dropdown_button.setMenu(self.run_debug_menu)
-
-        run_debug_layout.addWidget(self.action_button)
-        run_debug_layout.addWidget(self.dropdown_button)
-        self.run_debug_widget.setLayout(run_debug_layout)
-        toolbar.addWidget(self.run_debug_widget)
-        # self.run_action is no longer the primary way to trigger execution from toolbar
+        # Play Action Button
+        self.play_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "Execute", self)
+        self.play_action.setToolTip("Execute (Run/Debug based on selected mode) (F5)")
+        toolbar.addAction(self.play_action)
+        self.play_action.triggered.connect(self.handle_execution)
 
     @Slot()
-    def _on_main_action_button_clicked(self):
-        if self.current_run_mode == "Run":
-            self.status_bar.showMessage("Executing Run action...", 2000)
-            self._trigger_run_code() # Existing method to run code
-        elif self.current_run_mode == "Debug":
-            self.status_bar.showMessage("Starting Debug session...", 2000)
-            self._debug_code() # Call the new method
-        else:
-            QMessageBox.warning(self, "Unknown Mode", f"Unknown run mode: {self.current_run_mode}")
-
-    @Slot()
-    def _debug_code(self):
-        editor = self.current_editor
-        if not editor:
-            self.status_bar.showMessage("No active editor to debug.", 3000)
+    def handle_execution(self):
+        if not self.run_debug_mode_selector:
+            QMessageBox.critical(self, "Error", "Run/Debug mode selector not found.")
             return
 
-        if self.process and self.process.state() == QProcess.Running:
-            reply = QMessageBox.question(self, "Process Running", 
-                                         "A process (possibly another debug session or run) is already running. Stop it to start debugging?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
+        mode_text = self.run_debug_mode_selector.currentText().lower()
+        self._execute_code_from_config(mode=mode_text)
+
+    # @Slot() # Obsolete: Was connected to the old QToolButton UI
+    # def _on_main_action_button_clicked(self):
+    #     pass
+
+    # @Slot() # Obsolete: Logic merged into _execute_code_from_config
+    # def _debug_code(self):
+    #     pass
+
+    @Slot(str)
+    def _execute_code_from_config(self, mode: str):
+        editor = self.current_editor
+        if not editor:
+            self.status_bar.showMessage(f"No active editor to {mode}.", 3000)
+            return
+
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            reply = QMessageBox.question(self, "Process Running",
+                                         f"A process is already running. Stop it to start {mode}?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
                 self.process.kill()
-                self.process.waitForFinished(1000) # Give it a moment to die
+                self.process.waitForFinished(1000)
             else:
-                self.status_bar.showMessage("Debugging cancelled as another process is running.", 3000)
+                self.status_bar.showMessage(f"{mode.capitalize()} cancelled as another process is running.", 3000)
                 return
 
         code = editor.toPlainText()
         if not code.strip():
-            self.status_bar.showMessage("No code to debug.", 3000)
+            self.status_bar.showMessage(f"No code to {mode}.", 3000)
             return
 
-        # Ensure Python is the selected language for debugging with PDB
-        if self.language_selector.currentText() != "Python":
-            QMessageBox.warning(self, "Language Mismatch", "Debugging with PDB currently only supports Python. Please select Python as the language.")
-            py_idx = self.language_selector.findText("Python")
-            if py_idx != -1:
-                self.language_selector.setCurrentIndex(py_idx)
-            else: # Python not in list, problem with RUNNER_CONFIG
-                 self.status_bar.showMessage("Python language configuration not found for debugging.", 5000)
-                 return
+        self.status_bar.showMessage(f"Preparing to {mode} code...", 2000)
 
-        self._cleanup_temp_files() # Clean up any previous temp files
+        selected_language = self.language_selector.currentText()
+        lang_configs_for_ide = self.runner_config
+
+        if selected_language not in lang_configs_for_ide:
+            self.status_bar.showMessage(f"Language '{selected_language}' not configured.", 5000)
+            return
+
+        current_lang_specific_config = lang_configs_for_ide[selected_language]
+
+        if not isinstance(current_lang_specific_config, dict) or \
+           mode not in current_lang_specific_config or \
+           not isinstance(current_lang_specific_config[mode], list):
+            self.status_bar.showMessage(f"'{mode}' command not configured for '{selected_language}'.", 5000)
+            if mode != "run" and "run" in current_lang_specific_config and isinstance(current_lang_specific_config["run"], list):
+                 self.status_bar.showMessage(f"Falling back to 'run' mode for '{selected_language}'.", 3000)
+                 mode = "run"
+                 command_template = current_lang_specific_config[mode]
+            else:
+                return
+        else:
+            command_template = current_lang_specific_config[mode]
+
+        if mode == "debug":
+            if selected_language != "Python":
+                QMessageBox.warning(self, "Language Mismatch",
+                                    "Debugging with PDB currently only supports Python. Please select Python as the language.")
+                py_idx = self.language_selector.findText("Python")
+                if py_idx != -1:
+                    self.language_selector.setCurrentIndex(py_idx)
+                else:
+                    self.status_bar.showMessage("Python language configuration not found for debugging.", 5000)
+                    return
+                current_lang_specific_config = lang_configs_for_ide["Python"] # Re-fetch after potential lang change
+                if mode not in current_lang_specific_config or not isinstance(current_lang_specific_config[mode], list):
+                     self.status_bar.showMessage(f"'{mode}' command not configured for 'Python' after switch.", 5000)
+                     return
+                command_template = current_lang_specific_config[mode]
+
+            self._set_run_destination("Terminal")
+            self.output_tabs.setCurrentWidget(self.terminal_panel_te)
+            self.terminal_panel_te.clear()
+            self.terminal_panel_te.setFocus()
+            self.status_bar.showMessage("Starting debug session in terminal...", 2000)
+        else: # 'run' mode
+            if self.run_destination == "Output Panel":
+                self.output_tabs.setCurrentWidget(self.output_panel_te)
+                self.output_panel_te.clear()
+            else:
+                self.output_tabs.setCurrentWidget(self.terminal_panel_te)
+                self.terminal_panel_te.clear()
+
+        self._cleanup_temp_files()
         temp_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or tempfile.gettempdir()
-        
+
+        lang_ext = ".py"
+        if isinstance(lang_configs_for_ide.get(selected_language), dict) and \
+           isinstance(lang_configs_for_ide[selected_language].get("ext"), str):
+            lang_ext = lang_configs_for_ide[selected_language]["ext"]
+        elif selected_language == "Python":
+            lang_ext = ".py"
+        else:
+            lang_ext = ".tmp"
+
         try:
-            # For PDB, the extension must be .py
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding='utf-8', dir=temp_dir) as tf:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=lang_ext, delete=False, encoding='utf-8', dir=temp_dir) as tf:
                 self.current_temp_file_path = tf.name
                 tf.write(code)
         except Exception as e:
-            self.status_bar.showMessage(f"Error creating temp file for debugging: {e}", 5000)
+            self.status_bar.showMessage(f"Error creating temp file for {mode}: {e}", 5000)
             return
 
-        # --- Crucial for debug mode: Switch to terminal view ---
-        self._set_run_destination("Terminal") # Use existing method to switch state
-        self.output_tabs.setCurrentWidget(self.terminal_panel_te)
-        self.terminal_panel_te.clear() # Clear previous terminal content for new debug session
-
-        # Prepare PDB command
-        py_executable = sys.executable if sys.executable else "python"
-        command = [py_executable, "-m", "pdb", self.current_temp_file_path]
-
+        processed_command = []
         file_info = QFileInfo(self.current_temp_file_path)
         file_dir = file_info.absolutePath()
+        file_name_no_ext = file_info.completeBaseName()
+        self.current_output_file_path = os.path.join(temp_dir, file_name_no_ext) if current_lang_specific_config.get("output_based") else None
 
-        self.terminal_panel_te.appendPlainText(f"Starting PDB: {' '.join(command)}\n---")
+        for part in list(command_template):
+            part = part.replace("{file}", self.current_temp_file_path)
+            part = part.replace("{dir}", file_dir)
+            part = part.replace("{class_name}", file_name_no_ext)
+            if self.current_output_file_path:
+                 part = part.replace("{output_file_no_ext}", self.current_output_file_path)
+            processed_command.append(part)
+
+        log_message = f"Executing ({mode}): {' '.join(processed_command)}\n---"
+        if self.run_destination == "Output Panel" and mode == "run":
+            self.output_panel_te.appendPlainText(log_message)
+        else:
+            self.terminal_panel_te.appendPlainText(log_message)
 
         self.process = QProcess(self)
-        self.process.setWorkingDirectory(file_dir) 
-
+        self.process.setWorkingDirectory(file_dir)
         self.process.readyReadStandardOutput.connect(self._handle_process_output)
         self.process.readyReadStandardError.connect(self._handle_process_error)
         self.process.finished.connect(self._handle_process_finished)
-        self.process.errorOccurred.connect(self._handle_process_qprocess_error) 
+        self.process.errorOccurred.connect(self._handle_process_qprocess_error)
 
-        if sys.platform != "win32":
-            self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        if sys.platform != "win32" and mode == "debug":
+             self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
 
-        self.process.start(command[0], command[1:])
+        self.process.start(processed_command[0], processed_command[1:])
 
-        if not self.process.waitForStarted(3000): 
+        if not self.process.waitForStarted(3000 if mode == "debug" else 2000):
             err_msg = self.process.errorString()
-            self._append_to_output_or_terminal(f"Error starting PDB process: {err_msg}\n", is_error=True)
-            self._handle_process_finished(-1, QProcess.CrashExit) 
-        else:
-            self.status_bar.showMessage(f"PDB session started for {QFileInfo(self.current_temp_file_path).fileName()}", 5000)
-            self.terminal_panel_te.setFocus() 
+            self._append_to_output_or_terminal(f"Error starting process for {mode}: {err_msg}\n", is_error=True)
+            self._handle_process_finished(-1, QProcess.ProcessError.FailedToStart)
 
     @Slot()
     def _update_run_action_button_ui(self):
-        if not self.action_button: # Should not happen if setup correctly
-            return
-        if self.current_run_mode == "Run":
-            self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-            self.action_button.setToolTip("Run current script (F5)")
-        else: # Debug mode
-            # Using SP_BrowserReload as a placeholder for a 'bug' icon.
-            # A proper bug icon might require adding a resource file.
-            self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)) 
-            self.action_button.setToolTip("Debug current script (F5)")
+        # This method is part of the old UI and will be removed or heavily refactored.
+        # For now, it might try to access self.action_button which is None from __init__.
+        # if hasattr(self, 'action_button') and self.action_button:
+        #     if hasattr(self, 'current_run_mode') and self.current_run_mode == "Run":
+        #          self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        #          self.action_button.setToolTip("Run current script (F5)")
+        #     else:
+        #          self.action_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        #          self.action_button.setToolTip("Debug current script (F5)")
+        pass # Body replaced with pass as it's obsolete
 
     @Slot()
     def _set_run_mode_run(self):
-        self.current_run_mode = "Run"
-        # Ensure the correct menu item is checked (though QActionGroup should handle this)
-        if self.run_action_menu_item and not self.run_action_menu_item.isChecked():
-             self.run_action_menu_item.setChecked(True)
-        self._update_run_action_button_ui()
-        self.status_bar.showMessage("Switched to Run mode.", 2000)
+        # This method is part of the old UI and will be removed.
+        # self.current_run_mode = "Run"
+        # if self.run_action_menu_item and not self.run_action_menu_item.isChecked():
+        #      self.run_action_menu_item.setChecked(True)
+        # self._update_run_action_button_ui()
+        # self.status_bar.showMessage("Switched to Run mode.", 2000)
+        pass # Body replaced with pass as it's obsolete
 
     @Slot()
     def _set_run_mode_debug(self):
-        self.current_run_mode = "Debug"
-        # Ensure the correct menu item is checked
-        if self.debug_action_menu_item and not self.debug_action_menu_item.isChecked():
-            self.debug_action_menu_item.setChecked(True)
-        self._update_run_action_button_ui()
-        self.status_bar.showMessage("Switched to Debug mode.", 2000)
+        # This method is part of the old UI and will be removed.
+        # self.current_run_mode = "Debug"
+        # if self.debug_action_menu_item and not self.debug_action_menu_item.isChecked():
+        #     self.debug_action_menu_item.setChecked(True)
+        # self._update_run_action_button_ui()
+        # self.status_bar.showMessage("Switched to Debug mode.", 2000)
+        pass # Body replaced with pass as it's obsolete
 
     def _setup_output_dock(self):
         self.output_dock = QDockWidget("Output / Terminal", self)
@@ -556,7 +621,11 @@ class MainWindow(QMainWindow):
         # Add a general "Execute" action that respects the current Run/Debug mode
         self.execute_action = QAction("Execute (Run/Debug)", self)
         self.execute_action.setShortcut(QKeySequence("F5"))
-        self.execute_action.triggered.connect(self._on_main_action_button_clicked)
+        try:
+            self.execute_action.triggered.disconnect()
+        except (RuntimeError, TypeError):
+            pass # No connections or slot was C++
+        self.execute_action.triggered.connect(self.handle_execution) # Connect to the new unified handler
         run_menu.addAction(self.execute_action) # Add it to the Run menu
 
         run_destination_group = QActionGroup(self)
@@ -585,94 +654,11 @@ class MainWindow(QMainWindow):
         elif destination == "Terminal": self.terminal_dest_action.setChecked(True)
         self.status_bar.showMessage(f"Run destination set to: {destination}", 2000)
 
-    def _trigger_run_code(self):
-        if not self.current_editor:
-            self.status_bar.showMessage("No active editor tab to run code from.", 3000)
-            return
-        if self.process and self.process.state() == QProcess.Running:
-            reply = QMessageBox.question(self, "Process Running", "A process is already running. Stop it?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                self.process.kill()
-                self.process.waitForFinished(1000)
-            else: return
-        self._execute_current_code()
+    # def _trigger_run_code(self): # Obsolete
+    #     pass
 
-    def _execute_current_code(self):
-        editor = self.current_editor
-        if not editor: 
-            self.status_bar.showMessage("No active editor to execute.", 3000)
-            return
-
-        selected_language = self.language_selector.currentText()
-        lang_config = self.runner_config.get(selected_language)
-
-        if selected_language == "Python":
-            # Ensure we use the same Python interpreter running the IDE
-            # This makes the Python execution more robust.
-            py_executable = sys.executable if sys.executable else "python" 
-            lang_config = {"cmd": [py_executable, "{file}"], "ext": ".py"} # Override
-
-        if not lang_config:
-            self.status_bar.showMessage(f"Language '{selected_language}' not configured.", 5000)
-            return
-
-        code = editor.toPlainText()
-        if not code.strip():
-            self.status_bar.showMessage("No code to run.", 3000)
-            return
-
-        self._cleanup_temp_files()
-        temp_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or tempfile.gettempdir()
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=lang_config["ext"], delete=False, encoding='utf-8', dir=temp_dir) as tf:
-                self.current_temp_file_path = tf.name
-                tf.write(code)
-        except Exception as e:
-            self.status_bar.showMessage(f"Error creating temp file: {e}", 5000)
-            return
-
-        command_template = list(lang_config["cmd"])
-        processed_command = []
-        file_info = QFileInfo(self.current_temp_file_path)
-        file_dir = file_info.absolutePath()
-        file_name_no_ext = file_info.completeBaseName()
-        self.current_output_file_path = os.path.join(temp_dir, file_name_no_ext) if lang_config.get("output_based") else None
-
-        for part in command_template:
-            part = part.replace("{file}", self.current_temp_file_path)
-            part = part.replace("{dir}", file_dir)
-            part = part.replace("{class_name}", file_name_no_ext)
-            if self.current_output_file_path:
-                 part = part.replace("{output_file_no_ext}", self.current_output_file_path)
-            processed_command.append(part)
-
-        if self.run_destination == "Output Panel":
-            self.output_tabs.setCurrentWidget(self.output_panel_te)
-            self.output_panel_te.clear()
-            self.output_panel_te.appendPlainText(f"Running: {' '.join(processed_command)}\n---")
-        else:
-            self.output_tabs.setCurrentWidget(self.terminal_panel_te)
-            self.terminal_panel_te.appendPlainText(f"\n[{file_dir}]$ {' '.join(processed_command)}")
-
-        self.process = QProcess(self)
-        self.process.setWorkingDirectory(file_dir)
-        self.process.readyReadStandardOutput.connect(self._handle_process_output)
-        self.process.readyReadStandardError.connect(self._handle_process_error)
-        self.process.finished.connect(self._handle_process_finished)
-        self.process.errorOccurred.connect(self._handle_process_qprocess_error)
-        
-        command_str_for_shell = ' '.join(shlex.quote(part) for part in processed_command)
-        if "&&" in processed_command: 
-            if sys.platform == "win32": self.process.start("cmd", ["/C", command_str_for_shell])
-            else: self.process.start("sh", ["-c", command_str_for_shell])
-        else:
-            self.process.start(processed_command[0], processed_command[1:])
-
-        if not self.process.waitForStarted(2000):
-            err_msg = self.process.errorString()
-            self._append_to_output_or_terminal(f"Error starting process: {err_msg}\n")
-            self._handle_process_finished(-1, QProcess.CrashExit)
+    # def _execute_current_code(self): # Obsolete
+    #     pass
 
     def _handle_process_output(self):
         if not self.process: return
@@ -844,10 +830,10 @@ class MainWindow(QMainWindow):
         editor = self.current_editor
         if not editor or self._is_updating_from_network: # Ensure this flag is respected
             return
-        
+
         is_host_with_clients = self.network_manager._is_server and self.network_manager.server_client_sockets
-        is_connected_client = (not self.network_manager._is_server and 
-                               self.network_manager.client_socket and 
+        is_connected_client = (not self.network_manager._is_server and
+                               self.network_manager.client_socket and
                                self.network_manager.client_socket.state() == QTcpSocket.ConnectedState)
 
         # Client only sends data if editor is not read-only (which it would be in a session)
@@ -862,7 +848,7 @@ class MainWindow(QMainWindow):
         if not self.ai_assistant_window_instance:
             # Pass 'self' (MainWindow instance) and the signal emitter
             self.ai_assistant_window_instance = AIAssistantWindow(
-                main_window=self, 
+                main_window=self,
                 apply_code_signal_emitter=self.ai_apply_code_signal_emitter,
                 parent=self # Ensure it's properly parented
             )
@@ -883,30 +869,29 @@ class MainWindow(QMainWindow):
             # Store cursor position
             cursor = editor.textCursor()
             original_pos = cursor.position()
-            
+
             # Use a flag to prevent feedback loop if network sync is also active for text changes
             # This specific flag might need to be more general if text changes can come from other sources too
             # For now, reusing _is_updating_from_network, but consider a more specific one if needed.
-            self._is_updating_from_network = True 
+            self._is_updating_from_network = True
             editor.setPlainText(new_code)
             self._is_updating_from_network = False # Reset flag
-            
+
             # Restore cursor position (or try to)
             new_cursor = editor.textCursor()
             # Ensure cursor position is within new text bounds
-            new_cursor.setPosition(min(original_pos, len(new_code))) 
+            new_cursor.setPosition(min(original_pos, len(new_code)))
             editor.setTextCursor(new_cursor)
-            
+
             self.status_bar.showMessage("AI Assistant applied code changes.", 3000)
             # Optionally, mark the document as modified, which also updates tab asterisk
-            editor.document().setModified(True) 
+            editor.document().setModified(True)
         else:
             self.status_bar.showMessage("AI Assistant: No active editor to apply changes to.", 3000)
             # Optionally show a message box to the user
             QMessageBox.warning(self, "AI Assistant Error", "No active editor selected to apply code changes.")
     # --- End AI Assistant Methods ---
 
-    @Slot()
     @Slot()
     def _create_new_file_context_aware(self):
         target_dir = ""
@@ -918,15 +903,15 @@ class MainWindow(QMainWindow):
                 target_dir = path_from_selection
             elif os.path.isfile(path_from_selection):
                 target_dir = os.path.dirname(path_from_selection)
-            else: 
+            else:
                 target_dir = self.file_system_model.rootPath()
         else:
             target_dir = self.file_system_model.rootPath()
-            if not target_dir: 
+            if not target_dir:
                 target_dir = QDir.currentPath()
-        
+
         file_name, ok = QInputDialog.getText(self, "New File", "Enter new file name:", QLineEdit.EchoMode.Normal, "")
-        
+
         if ok and file_name:
             file_name = file_name.strip() # Ensure no leading/trailing whitespace in filename itself
             if not file_name:
@@ -943,7 +928,7 @@ class MainWindow(QMainWindow):
 
             # Check if file already exists
             if os.path.exists(full_file_path):
-                QMessageBox.warning(self, "File Exists", 
+                QMessageBox.warning(self, "File Exists",
                                     f"A file or folder with the name '{file_name}' already exists in '{target_dir}'.")
                 self.status_bar.showMessage(f"File creation aborted: '{file_name}' already exists.", 3000)
                 return
@@ -952,12 +937,12 @@ class MainWindow(QMainWindow):
             try:
                 with open(full_file_path, 'w', encoding='utf-8') as f:
                     # File is created empty, nothing to write for now
-                    pass 
+                    pass
                 self.status_bar.showMessage(f"Successfully created file: {full_file_path}", 3000)
-                
+
                 # Open the newly created file in a new editor tab
                 self._add_new_editor_tab(file_path=full_file_path)
-                
+
                 # Optional: Select the newly created file in the tree view.
                 # This requires finding the model index for the new file path.
                 # new_file_index = self.file_system_model.index(full_file_path)
@@ -966,7 +951,7 @@ class MainWindow(QMainWindow):
                 #    self.file_tree_view.scrollTo(new_file_index)
 
             except OSError as e:
-                QMessageBox.critical(self, "Creation Error", 
+                QMessageBox.critical(self, "Creation Error",
                                      f"Could not create file: {full_file_path}\n\nError: {e}")
                 self.status_bar.showMessage(f"Error creating file: {e}", 5000)
                 return
@@ -976,21 +961,22 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched_object, event: QEvent):
         if watched_object is self.terminal_panel_te and event.type() == QEvent.Type.KeyPress:
-            if self.process and self.process.state() == QProcess.ProcessState.Running and self.current_run_mode == "Debug":
+            if self.process and self.process.state() == QProcess.ProcessState.Running and \
+               self.run_debug_mode_selector and self.run_debug_mode_selector.currentText() == "Debug":
                 key_event = event # event is already a QKeyEvent
 
                 if key_event.key() == Qt.Key_Return or key_event.key() == Qt.Key_Enter:
                     cursor = self.terminal_panel_te.textCursor()
-                    
+
                     # Move cursor to the beginning of the current line (block)
                     cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
                     # Select text to the end of the current line (block)
                     cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
                     current_line_text = cursor.selectedText()
 
-                    prompts_to_check = ["(Pdb) ", "Pdb> ", "(Pdb)", "Pdb>", "... ", "...> "] 
-                    command_text = current_line_text 
-                    
+                    prompts_to_check = ["(Pdb) ", "Pdb> ", "(Pdb)", "Pdb>", "... ", "...> "]
+                    command_text = current_line_text
+
                     found_prompt_in_line = False
                     for pdb_prompt in prompts_to_check:
                         prompt_idx = current_line_text.rfind(pdb_prompt)
@@ -998,19 +984,19 @@ class MainWindow(QMainWindow):
                             command_text = current_line_text[prompt_idx + len(pdb_prompt):]
                             found_prompt_in_line = True
                             break
-                    
+
                     if not found_prompt_in_line:
                         command_text = current_line_text
 
                     self.process.write(command_text.encode('utf-8') + b'\n')
-                    
+
                     return False # Let event propagate
 
                 elif key_event.key() == Qt.Key_C and key_event.modifiers() & Qt.ControlModifier:
                     if sys.platform == "win32":
                         self.process.generateConsoleCtrlEvent(0) # CTRL_C_EVENT
                     else:
-                        self.process.terminate() 
+                        self.process.terminate()
                     self.terminal_panel_te.appendPlainText("^C\n")
                     return True # Event handled
 
@@ -1062,3 +1048,5 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
+
+[end of main_window.py]
