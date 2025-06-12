@@ -59,6 +59,34 @@ class MainWindow(QMainWindow):
         self.update_ui_for_control_state() # Initial UI update
         self.load_session() # Load session on startup
 
+    def initialize_project(self, path: str):
+        if path is None:
+            # This is a client-only startup.
+            # Open a single, empty "Untitled" tab.
+            self.open_new_tab() # Call with no arguments for an empty tab
+            # Hide the file explorer as there is no project context.
+            if hasattr(self, 'file_explorer_dock'): # Check if dock exists
+                self.file_explorer_dock.setVisible(False)
+            print("MainWindow: Initialized for client-only mode (no project path).")
+            return # Stop further processing
+
+        # Placeholder for actual project/file/folder initialization
+        print(f"MainWindow: initialize_project called with path: {path}")
+        if os.path.isfile(path):
+            self.open_new_tab(file_path=path)
+        elif os.path.isdir(path):
+            if hasattr(self, 'file_explorer'):
+                self.file_explorer.set_root_path(path)
+                if hasattr(self, 'file_explorer_dock'):
+                    self.file_explorer_dock.setVisible(True) # Ensure it's visible for folder opening
+            # Potentially open a default file or just show the explorer
+        else:
+            print(f"MainWindow: Path is not a file or directory: {path}")
+            # Fallback to client-only like state if path is invalid
+            self.open_new_tab()
+            if hasattr(self, 'file_explorer_dock'):
+                self.file_explorer_dock.setVisible(False)
+
     def setup_ui(self):
         # Central Editor View (QTabWidget)
         self.tab_widget = QTabWidget()
@@ -389,6 +417,12 @@ class MainWindow(QMainWindow):
                 print(f"LOG: start_hosting_session - is_host={self.is_host}, has_control={self.has_control}")
             else:
                 QMessageBox.critical(self, "Error", "Failed to start hosting session.")
+
+    @Slot()
+    def join_session_from_welcome_page(self):
+        print("MainWindow: join_session_from_welcome_page called.")
+        self.connect_to_host_session()  # This method already exists
+        self.initialize_project(None)   # Setup for client-only mode
 
     @Slot()
     def connect_to_host_session(self):
